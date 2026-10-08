@@ -357,3 +357,22 @@ fn explicit_mode_preserves_independent_tool_and_panel_options() {
     assert_eq!(app.left, LeftPanel::Tool("export"));
     assert!(!app.left_open);
 }
+
+#[test]
+fn opening_a_pdf_keeps_a_closed_left_panel_and_the_chosen_tool() {
+    use pdfcraft_ui_egui::{LeftPanel, Mode};
+    // `--left closed` without `--mode`, default workspace Edit: the panel stays closed.
+    let mut app = PdfCraftApp::new();
+    app.default_mode = Mode::Edit;
+    app.set_option("left", "closed").unwrap();
+    app.open_bytes("fixture.pdf", None, FIXTURE.to_vec()).unwrap();
+    assert_eq!(app.mode, Mode::Edit);
+    assert!(!app.left_open);
+    // Default All Tools: opening another PDF leaves the tool panel the user picked.
+    let mut app = PdfCraftApp::new();
+    app.set_option("tool", "export").unwrap();
+    app.open_bytes("first.pdf", None, FIXTURE.to_vec()).unwrap();
+    app.open_bytes("second.pdf", None, FIXTURE.to_vec()).unwrap();
+    assert_eq!(app.mode, Mode::AllTools);
+    assert_eq!(app.left, LeftPanel::Tool("export"));
+}
