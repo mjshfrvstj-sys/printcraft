@@ -21,7 +21,11 @@ use pdfcraft_ui_egui::PdfCraftApp;
 
 #[cfg(target_os = "macos")]
 mod apple_events;
+#[cfg(any(windows, test))]
+mod open_protocol;
 mod updates;
+#[cfg(windows)]
+mod windows_instance;
 
 /// Freedesktop app id: the `.desktop` file name and the hicolor icon name.
 const APP_ID: &str = "ai.storyteller.pdfcraft";
@@ -46,6 +50,10 @@ fn migrate_legacy_folders() {
         let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
         moves.push((local.as_ref().map(|d| d.join("PrintCraft")), local.map(|d| d.join("PdfCraft"))));
     }
+    migrate_folders(moves);
+}
+
+fn migrate_folders(moves: impl IntoIterator<Item = (Option<std::path::PathBuf>, Option<std::path::PathBuf>)>) {
     for (old, new) in moves {
         let (Some(old), Some(new)) = (old, new) else { continue };
         if !old.is_dir() || new.exists() {
@@ -73,7 +81,15 @@ fn main() -> eframe::Result {
     let mut files = Vec::new();
     let mut options: Vec<(String, String)> = Vec::new();
     let mut control_file: Option<String> = None;
+    #[cfg(not(windows))]
     let mut args = std::env::args().skip(1);
+    #[cfg(windows)]
+    let mut args = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "PdfCraft requires Unicode document paths")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(windows_launch_error)?
+        .into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--version" => {
@@ -88,6 +104,17 @@ fn main() -> eframe::Result {
             _ => files.push(a),
         }
     }
+    // Migration must precede IPC setup: creating the new settings directory first would make
+    // the rename migration skip old preferences, recent files and recovery data.
+    migrate_legacy_folders();
+    #[cfg(windows)]
+    let windows_instance = match start_windows_instance(&files) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return Ok(()),
+        Err(error) => return Err(windows_launch_error(error)),
+    };
+    #[cfg(windows)]
+    let windows_instance = &windows_instance;
     let integrated = cfg!(target_os = "macos");
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PdfCraft")
@@ -104,7 +131,6 @@ fn main() -> eframe::Result {
     if integrated {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
-    migrate_legacy_folders();
     // eframe would otherwise derive the settings folder from the app id: keep it under "PdfCraft".
     let persistence_path = eframe::storage_dir("PdfCraft").map(|d| d.join("app.ron"));
     let mut native = eframe::NativeOptions { viewport, persistence_path, ..Default::default() };
@@ -130,6 +156,20 @@ fn main() -> eframe::Result {
             {
                 app.os_events = Some(apple_events.connect(&cc.egui_ctx));
             }
+            #[cfg(windows)]
+            {
+                let ctx = cc.egui_ctx.clone();
+                let mut poll = windows_instance.connect(move || ctx.request_repaint());
+                let ctx = cc.egui_ctx.clone();
+                app.os_events = Some(Box::new(move || {
+                    let batches = poll();
+                    if !batches.is_empty() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    batches.into_iter().map(pdfcraft_ui_egui::OsEvent::Open).collect()
+                }));
+            }
             if let Some(file) = &control_file {
                 let client = app.attach_control(&cc.egui_ctx);
                 match pdfcraft_ui_egui::control::serve(client).and_then(|ep| write_control_file(file, ep.port, &ep.token).map(|()| ep.port)) {
@@ -152,6 +192,25 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(windows)]
+fn windows_launch_error(error: std::io::Error) -> eframe::Error {
+    // Release builds have no console. Native diagnostics run before UI language initialization.
+    rfd::MessageDialog::new()
+        .set_title("PdfCraft could not hand off the documents")
+        .set_description(format!("{error}\n\nCheck the existing PdfCraft window before retrying: the documents may already be queued. Use the same Windows account and elevation for both launches."))
+        .set_level(rfd::MessageLevel::Error)
+        .show();
+    eframe::Error::AppCreation(Box::new(error))
+}
+
+#[cfg(windows)]
+fn start_windows_instance(files: &[String]) -> std::io::Result<Option<windows_instance::WindowsInstance>> {
+    let profile = eframe::storage_dir("PdfCraft").ok_or_else(|| std::io::Error::other("Windows user profile is unavailable"))?;
+    let paths = open_protocol::absolute_paths(files)?;
+    std::fs::create_dir_all(&profile)?;
+    windows_instance::WindowsInstance::start(&windows_instance::endpoint(&profile), &profile.join("document-open.lock"), &paths)
 }
 
 /// Write the control endpoint so that only the current user can read the token.
@@ -270,6 +329,25 @@ fn pick_adapter(adapters: &[(u32, u32, eframe::wgpu::DeviceType)], displays: &[(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rename_migration_preserves_preferences_and_does_not_replace_new_settings() {
+        let root = std::env::temp_dir().join(format!("pdfcraft-migration-{}", std::process::id()));
+        let old = root.join("PrintCraft");
+        let new = root.join("PdfCraft");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("app.ron"), "legacy preferences").unwrap();
+        super::migrate_folders([(Some(old.clone()), Some(new.clone()))]);
+        assert_eq!(std::fs::read_to_string(new.join("app.ron")).unwrap(), "legacy preferences");
+        // Later launches see the new directory (including IPC state) and leave it intact.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("app.ron"), "older preferences").unwrap();
+        super::migrate_folders([(Some(old.clone()), Some(new.clone()))]);
+        assert_eq!(std::fs::read_to_string(new.join("app.ron")).unwrap(), "legacy preferences");
+        assert!(old.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn gpu_backends_avoid_vulkan_on_windows_and_prefer_low_power() {
         let mut native = eframe::NativeOptions::default();
