@@ -954,6 +954,56 @@ fn page_images_move_turn_replace_and_delete() {
 }
 
 #[test]
+fn form_artwork_edits_only_the_selected_placement() {
+    let mut doc = fixture(); // three pages share resources; pages 0 and 1 also share contents
+    let mut form = Dict::new();
+    form.set(b"Subtype".to_vec(), Object::name("Form"));
+    form.set(b"BBox".to_vec(), Object::Array([10, 20, 110, 70].map(Object::Int).to_vec()));
+    form.set(b"Matrix".to_vec(), Object::Array([2, 0, 0, 3, -20, -60].map(Object::Int).to_vec()));
+    let artwork = doc.add(Object::Stream(Stream::flate(form, b"1 0 0 rg 10 20 100 50 re f")));
+    doc.update_dict(pdfcraft_cos::ObjRef::new(6, 0), |d| {
+        let mut xo = Dict::new();
+        xo.set(b"Figure".to_vec(), Object::Ref(artwork));
+        d.set(b"XObject".to_vec(), Object::Dict(xo));
+    })
+    .unwrap();
+    let content = b"q 1 0 0 1 40 80 cm /Figure Do Q q 1 0 0 1 300 400 cm /Figure Do Q BT /F1 9 Tf (Caption) Tj ET";
+    doc.set(pdfcraft_cos::ObjRef::new(7, 0), Object::Stream(Stream::flate(Dict::new(), content)));
+    let mut doc = reopen(&doc);
+    let original = doc.get(artwork);
+    let imgs = images::page_images(&doc, 0).unwrap();
+    assert_eq!(imgs.len(), 2);
+    assert!(imgs[0].is_form);
+    assert_eq!((imgs[0].width, imgs[0].height), (0, 0));
+    assert!(close(imgs[0].rect, [40.0, 80.0, 240.0, 230.0]));
+    let target = [60.0, 100.0, 160.0, 175.0];
+    images::change_image(&mut doc, 0, 0, &images::ImageChange::Transform(images::rect_to_rect(imgs[0].rect, target))).unwrap();
+    let mut doc = reopen(&doc);
+    let moved = images::page_images(&doc, 0).unwrap();
+    assert!(close(moved[0].rect, target));
+    assert_eq!(moved[1].rect, imgs[1].rect);
+    assert_eq!(images::page_images(&doc, 1).unwrap()[0].rect, imgs[0].rect);
+    assert_eq!(*doc.get(artwork), *original, "the shared Form and its unknown data are untouched");
+    assert_eq!(text::text_lines(&doc, 0).unwrap()[0].text, "Caption");
+    let t = images::turn_about_centre(target, 1, false, false);
+    images::change_image(&mut doc, 0, 0, &images::ImageChange::Transform(t)).unwrap();
+    assert!(close(images::page_images(&doc, 0).unwrap()[0].rect, [72.5, 87.5, 147.5, 187.5]));
+    assert!(images::change_image(&mut doc, 0, 0, &images::ImageChange::Replace(artwork)).is_err());
+    images::change_image(&mut doc, 0, 0, &images::ImageChange::Delete).unwrap();
+    let doc = reopen(&doc);
+    assert_eq!(images::page_images(&doc, 0).unwrap().len(), 1);
+    assert_eq!(images::page_images(&doc, 1).unwrap().len(), 2);
+    // Invalid bounds are skipped without interpreting the Form stream.
+    let mut doc = doc;
+    let mut broken = (*doc.get(artwork)).clone();
+    if let Object::Stream(s) = &mut broken {
+        s.dict.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0)]));
+    }
+    doc.set(artwork, broken);
+    assert!(images::page_images(&doc, 0).unwrap().is_empty());
+}
+
+#[test]
 fn paragraphs_take_new_formatting() {
     let mut doc = text_page("BT /F1 10 Tf 12 TL 100 700 Td (One two three four five six seven) Tj T* (eight nine ten eleven twelve) Tj ET");
     let before = text::text_blocks(&doc, 0).unwrap()[0].clone();
@@ -1267,4 +1317,67 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
         assert!(err.contains("U+4E2D"), "{err}");
         update_content(&mut doc, 0, n, &Content::Text(arabic("ب"))).unwrap();
     }
+}
+
+fn xobject(doc: &Document, page: usize, name: &[u8]) -> Option<pdfcraft_cos::ObjRef> {
+    let p = &pdfcraft_model::pages(doc)[page];
+    let res = doc.resolve(p.dict.get(b"Resources")?);
+    let xo = doc.resolve(res.as_dict()?.get(b"XObject")?);
+    xo.as_dict()?.get(name).and_then(Object::as_ref)
+}
+
+fn annot_at(doc: &Document, page: usize, index: usize) -> pdfcraft_cos::ObjRef {
+    let p = &pdfcraft_model::pages(doc)[page];
+    let list = doc.resolve(p.dict.get(b"Annots").unwrap());
+    list.as_array().unwrap()[index].as_ref().unwrap()
+}
+
+#[test]
+fn fill_sign_flatten_bakes_marks_keeps_other_comments_and_does_not_reuse_pcfl0() {
+    use pdfcraft_annot::{FillMark, Markup, Meta, NewAnnotation, Shape, Style, add_annotation, summaries};
+    let mut doc = fixture();
+    assert_eq!(flatten_fill_sign(&mut doc, &[0]).unwrap(), 0);
+    assert!(!doc.is_modified(), "nothing to flatten leaves the file alone");
+
+    let meta = Meta { date: None, id: "x".into() };
+    let add = |doc: &mut Document, shape: Shape, contents: &str| {
+        let style = Style::default_for(&shape);
+        add_annotation(doc, &NewAnnotation { page: 0, shape, style, contents: contents.into(), author: "a".into() }, &meta).unwrap()
+    };
+    add(&mut doc, Shape::Rectangle { rect: [10.0, 10.0, 80.0, 40.0] }, "box");
+    assert_eq!(flatten(&mut doc, &[0], true, false).unwrap(), 1);
+    let kept = xobject(&doc, 0, b"PCFl0").expect("the first flatten's XObject");
+
+    add(&mut doc, Shape::Typewriter { rect: [20.0, 500.0, 140.0, 520.0], font_size: 10.0 }, "Hello");
+    doc.update_dict(annot_at(&doc, 0, 0), |d| {
+        d.remove(b"PCFillSign");
+    })
+    .unwrap();
+    add(&mut doc, Shape::Mark { rect: [100.0, 100.0, 120.0, 120.0], mark: FillMark::Check }, "");
+    add(&mut doc, Shape::Signature { strokes: vec![vec![[10.0, 50.0], [40.0, 80.0], [70.0, 50.0]]] }, "");
+    doc.update_dict(annot_at(&doc, 0, 2), |d| d.set(b"Subj".to_vec(), pdfcraft_cos::PdfString::text("Pencil"))).unwrap();
+    add(&mut doc, Shape::TypedSignature { rect: [20.0, 40.0, 90.0, 70.0], contours: vec![vec![[0.1, 0.2], [0.5, 0.9], [0.9, 0.2]]] }, "");
+    add(&mut doc, Shape::TextMarkup { kind: Markup::Highlight, quads: vec![[20.0, 400.0, 80.0, 400.0, 20.0, 390.0, 80.0, 390.0]] }, "keep");
+    add(&mut doc, Shape::TextBox { rect: [20.0, 300.0, 140.0, 340.0], font_size: 12.0 }, "Note");
+    add(&mut doc, Shape::Ink { strokes: vec![vec![[200.0, 200.0], [220.0, 220.0], [240.0, 200.0]]] }, "pencil");
+    let old = add(&mut doc, Shape::Signature { strokes: vec![vec![[300.0, 50.0], [330.0, 80.0], [360.0, 50.0]]] }, "");
+    doc.update_dict(annot_at(&doc, 0, old), |d| {
+        d.remove(b"PCFillSign");
+    })
+    .unwrap();
+    let hidden = add(&mut doc, Shape::Typewriter { rect: [20.0, 600.0, 140.0, 620.0], font_size: 10.0 }, "secret");
+    doc.update_dict(annot_at(&doc, 0, hidden), |d| d.set(b"F".to_vec(), Object::Int(2))).unwrap();
+
+    let n = flatten_fill_sign(&mut doc, &[0]).unwrap();
+    assert_eq!(n, 5, "text, check, both signatures and the typed signature; the hidden one stays");
+    assert_eq!(xobject(&doc, 0, b"PCFl0"), Some(kept), "an existing PCFl0 is not replaced");
+    let newest = streams(&doc, 0).last().unwrap().clone();
+    assert!(newest.contains("/PCFl1 Do") && !newest.contains("/PCFl0 Do"), "{newest}");
+
+    let doc = reopen(&doc);
+    let mut left: Vec<String> = summaries(&doc).iter().map(|s| s.contents.clone().unwrap_or_default()).collect();
+    left.sort();
+    assert_eq!(left, ["Note", "keep", "pencil", "secret"]);
+    assert!(summaries(&doc).iter().any(|s| s.intent.as_deref() == Some("FreeTextTypeWriter")), "the hidden typewriter stays");
+    assert_eq!(summaries(&doc).iter().filter(|s| s.intent.as_deref() == Some("FreeTextTypeWriter")).count(), 1);
 }

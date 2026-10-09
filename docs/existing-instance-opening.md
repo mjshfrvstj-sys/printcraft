@@ -298,3 +298,15 @@ The integrated upstream #516 added a forms→render dev-dependency that the laye
 checker rejected. Its rendering regression is relocated unchanged to an engine
 integration test, with its synthetic fixture and parity evidence retained. The
 forms crate no longer depends sideways on render; the layering policy is unchanged.
+
+### PR #616 conflict resolution
+
+Integration with upstream `90bb2f1` retains its roadmap, forms tests and parity
+updates. Upstream #591 independently moved the same form-rendering regression into
+`crates/engine/tests/form_rotation.rs`. That version retains the fixture and all
+rendering assertions, so the fork's duplicate `form_rotation_render.rs` is removed
+and parity cites upstream's test. Forms and engine test code now match upstream;
+no layering exception is needed. Startup incorporates upstream GPU surface-limit
+handling while retaining the existing launch-owned Windows listener and retry tests.
+Validation for this integrated commit is recorded in PR #616; earlier CI results
+above are historical and do not substitute for the new run.
