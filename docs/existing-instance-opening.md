@@ -139,26 +139,45 @@ unsaved work, missing files within a batch, closed panels, selected tools and
 explicit session modes. Existing `doc_open` automation remains the headless opening
 API; this transport does not add another command surface.
 
-Windows-gated tests cover owner election, simultaneous launches, multiple batches,
-bounded queues, oversized requests, stalled clients, missing acknowledgement
-receipts, listener recovery and a killed primary process. Cross-compiling these
-tests verifies types, not runtime behavior. Before release, run them on Windows and
-exercise Explorer/Open With/MSI association, Unicode and multiple paths, minimized
-window activation, different accounts/elevation, and crash/relaunch. macOS-hosted
-checks cannot establish those Windows behaviors.
+Native Windows CI at `275cee6f5a9adb87c01888a40a3ba851a71dd78f` compiled and
+executed the Windows-gated tests in the existing workflow, without adding a job.
+They cover named-pipe creation/connection, simultaneous owner election, startup
+races, multiple batches, bounded queues, malformed/oversized requests, idle reads,
+stalled clients, missing acknowledgement receipts, listener recovery, a killed
+primary process and bounded shutdown. The OS-event UI regressions also passed.
 
-Validation on the macOS development host for this upstream snapshot:
+Verified results from the completed jobs:
 
-- Workspace formatting and all-target Clippy with warnings denied: passed.
-- Workspace tests: 823 passed, 0 failed, 5 ignored (network release lookup, two
-  optional corpus tests, timing probe and temporary Keychain test).
-- Layering: 31 crates, no violations. WASM: all 27 checked crates passed.
-- Assets: 247 repository, 6 dependency-bundled and 22 build-time assets passed.
-- Parity: passed, 829 entries; the existing 93 missing-automation-tool notices
-  remain. Dependency advisories, bans, licenses and sources: passed.
-- CLI without default features: passed.
-- Actual protocol and Windows backend source, including Windows tests: MSVC-target
-  `cargo check --tests` and Clippy passed through an isolated dependency harness.
-- Full Windows app cross-check: blocked in existing `ring`/`aws-lc-sys` C builds
-  by the missing Windows SDK (`assert.h`). Windows tests were not executed;
-  native Windows, Linux and FreeBSD execution was unavailable on this host.
+- [Windows](https://github.com/mjshfrvstj-sys/printcraft/actions/runs/37866274912/job/113613646961):
+  836 passed, 0 failed, 4 ignored.
+- [Linux](https://github.com/mjshfrvstj-sys/printcraft/actions/runs/37866274912/job/113613646817):
+  834 passed, 0 failed, 4 ignored (with craft-fonts).
+- [macOS](https://github.com/mjshfrvstj-sys/printcraft/actions/runs/37866274912/job/113613646915):
+  823 passed, 0 failed, 5 ignored.
+- Workspace formatting, all-target Clippy with warnings denied, layering, assets,
+  parity, WASM and dependency checks passed. Parity retains the existing 93
+  missing-automation-tool notices.
+- Local checks also passed: CLI without default features and MSVC-target protocol/
+  backend test compilation and Clippy in an isolated dependency harness.
+
+An optional repeat of the Windows job remained queued for over 12 hours without
+creating a job and was cancelled. GitHub consequently shows the overall run as
+cancelled; the individual completed jobs linked above remain successful. The
+repeat supplied no additional execution evidence.
+
+The 15-minute mutation-fuzz job completed 156,818 iterations with zero crashes and
+two timeout findings, so it is **not a clean fuzz result** despite its successful
+job status. Both findings (`bb2abb8046a87f10` and `1cf87f3b852b5003`) also exceeded
+15 seconds in optimized CLI builds of unchanged upstream base `355de90`, using
+`check-one <finding.pdf> --dpi 18 --edit`. A sample of the first finding was in
+`hayro-jbig2` symbol decoding. The relevant decoder, rendering and CLI sources are
+unchanged by this branch. These pre-existing decoder timeouts need a separate
+hardening follow-up with synthetic regressions; corpus-derived artifacts are not
+committed here.
+
+Still required on a real Windows desktop: Explorer/Open With/MSI association,
+Unicode and multiple-file selection, minimized-window activation, foreground
+restrictions, and different accounts/elevation. Native IPC tests do not establish
+those shell, focus or security-boundary behaviors. Windows ARM64 and FreeBSD
+runtime validation were not performed. macOS/Linux behavior and PR #172 workspace
+semantics remain covered by their existing tests and the OS-event regressions.
