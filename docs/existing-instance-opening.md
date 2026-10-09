@@ -6,6 +6,14 @@ forward their document paths and exit after the primary accepts the batch. A lau
 without paths requests window activation. Secondary launch options, including
 `--mode` and `--control`, are not forwarded or applied to the running session.
 
+Options are parsed before instance selection. Unknown `--name` options also consume
+their next argument as a value and are ignored by a secondary; do not put a document
+path after an option that is missing its value. A secondary `--control` launch does
+not create an endpoint file. To configure the primary session, supply startup
+options when no instance is running, or use its already-enabled control channel.
+When parsed as an option, `--version` prints the version and exits before election,
+forwarding or activation, even if document paths preceded it.
+
 ## Integration with current upstream
 
 This implementation was re-evaluated against `storytold/pdfcraft` main at
@@ -66,6 +74,12 @@ There is no PID file whose stale contents could select the wrong process.
 - At most 16 queued batches and eight active clients. Each client has a two-second
   I/O deadline. No blocking flush is used. Worker shutdown waits only for bounded
   client work.
+
+Windows idle nonblocking reads can surface as zero bytes through `std::fs::File`.
+The pipe adapter treats these as temporary unavailability, not end-of-file. This
+also means a disconnected peer may wait until the two-second deadline. The native
+idle-read regression covers the premature EOF/acknowledgement race discovered by
+the first Windows CI run.
 
 The receiver validates and enqueues a whole batch, then acknowledges acceptance.
 The launcher consumes the acknowledgement and sends a receipt before closing.

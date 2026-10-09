@@ -125,6 +125,8 @@ M0 → M1 → M2 → M3 → M4 must happen in order. After M4, M5–M12 can run 
 
 ## Log
 
+- **2026-10-08 (fork, M14):** Reused the existing Windows CI job for native existing-instance validation. Its first run caught zero-byte idle pipe reads being mistaken for EOF; normalize them into bounded retries and add a native regression. Clarified secondary-launch option handling. The cross-platform run also exposed an existing picker test's one-second scheduling assumption; its tests now use a bounded completion wait tolerant of panic-backtrace output on busy runners, without changing production picker behavior.
+
 - **2026-10-07 (fork, M14):** Re-evaluated Windows existing-instance opening against current PdfCraft and PR #172. Owner-scoped named pipes forward bounded path batches through OS events into ordinary tabs; preserve workspace/tool/panel state and legacy settings migration. Portable protocol/UI regressions and Windows-gated race/crash/timeout tests added; native Windows validation remains pending. Linux/FreeBSD IPC deferred. See `docs/existing-instance-opening.md`.
 
 Newest first. One line per session: the date, what moved, and the new overall percentage.

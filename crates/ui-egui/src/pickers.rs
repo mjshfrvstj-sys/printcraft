@@ -140,18 +140,22 @@ impl PdfCraftApp {
 mod tests {
     use super::*;
 
+    fn wait_for_worker(pickers: &Pickers) {
+        // This tests completion, not picker latency. A panic hook printing a backtrace on
+        // a busy CI runner can take longer than the former one-second polling window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pickers.showing.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!pickers.showing.load(Ordering::SeqCst), "picker worker did not finish before the deadline");
+    }
+
     #[test]
     fn worker_queues_the_pick_and_clears_showing() {
         let pickers = Pickers::default();
         pickers.showing.store(true, Ordering::SeqCst);
         assert!(pickers.spawn(PickFor::Open, None, None, async { vec![PathBuf::from("a.pdf")] }));
-        for _ in 0..500 {
-            if !pickers.showing.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(!pickers.showing.load(Ordering::SeqCst));
+        wait_for_worker(&pickers);
         let picked = pickers.take();
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].paths, vec![PathBuf::from("a.pdf")]);
@@ -165,13 +169,7 @@ mod tests {
             panic!("picker failed")
         }
         assert!(pickers.spawn(PickFor::Open, None, None, async { fail() }));
-        for _ in 0..500 {
-            if !pickers.showing.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(!pickers.showing.load(Ordering::SeqCst));
+        wait_for_worker(&pickers);
         assert!(pickers.take().is_empty());
     }
 }

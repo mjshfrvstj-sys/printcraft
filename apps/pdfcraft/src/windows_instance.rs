@@ -228,10 +228,15 @@ struct Pipe(File);
 
 impl Read for Pipe {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.0.read(bytes).map_err(|error| {
-            // ERROR_NO_DATA on a connected NOWAIT pipe means no bytes yet, not EOF.
-            if error.raw_os_error() == Some(232) { io::ErrorKind::WouldBlock.into() } else { error }
-        })
+        match self.0.read(bytes) {
+            // An empty PIPE_NOWAIT read can surface as zero bytes through std's Windows
+            // file API, not only ERROR_NO_DATA. It must not end a frame or ACK exchange.
+            // A real disconnect may also return zero: the protocol deadline bounds that
+            // wait. Preserve Read's empty-buffer behavior.
+            Ok(0) if !bytes.is_empty() => Err(io::ErrorKind::WouldBlock.into()),
+            Err(error) if error.raw_os_error() == Some(232) => Err(io::ErrorKind::WouldBlock.into()),
+            result => result,
+        }
     }
 }
 
@@ -256,8 +261,8 @@ fn connect(name: &str) -> io::Result<Pipe> {
 }
 
 fn into_file(stream: Stream) -> io::Result<Pipe> {
-    // Keep std's raw ERROR_NO_DATA error on nonblocking reads, and avoid interprocess's automatic
-    // background flush on drop: a non-reading client must not retain handles/threads forever.
+    // Normalize std's nonblocking reads in Pipe, and avoid interprocess's automatic background
+    // flush on drop: a non-reading client must not retain handles/threads forever.
     OwnedHandle::try_from(stream).map(|handle| Pipe(File::from(handle))).map_err(|_| io::Error::other("unexpected shared pipe handle"))
 }
 
@@ -281,6 +286,22 @@ mod tests {
     fn name() -> String {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         format!(r"\\.\pipe\pdfcraft-open-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[test]
+    fn windows_pipe_idle_reads_retry_until_data_arrives() {
+        let name = name();
+        let listener = listener(&name).unwrap();
+        let mut client = connect(&name).unwrap();
+        let mut server = into_file(listener.accept().unwrap()).unwrap();
+        let mut byte = [0];
+        assert_eq!(client.read(&mut []).unwrap(), 0);
+        assert_eq!(client.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(server.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let deadline = Instant::now() + IO_TIMEOUT;
+        protocol::write_all(&mut server, &[7], deadline).unwrap();
+        protocol::read_exact(&mut client, &mut byte, deadline).unwrap();
+        assert_eq!(byte, [7]);
     }
 
     #[test]
