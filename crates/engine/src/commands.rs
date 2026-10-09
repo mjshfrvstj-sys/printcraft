@@ -42,6 +42,9 @@ pub enum Needs {
     Undo,
     /// There is something to redo.
     Redo,
+    /// A document is open in two-page view. The engine has no views, so it checks the
+    /// document and the frontend checks the view.
+    TwoPageView,
 }
 
 /// A keyboard shortcut. `command` is ⌘ on macOS and Ctrl elsewhere.
@@ -146,11 +149,21 @@ const HELP: Option<&str> = Some("Help");
 /// Every command, in menu order.
 pub const COMMANDS: &[CommandSpec] = &[
     c("file.open", "Open…", FILE, Some(Shortcut::cmd("O")), Nothing, "folder-open"),
+    c("file.open_recent", "Open Recent", FILE, None, Nothing, "clock"),
+    c("file.pin_folder", "Pin folder to Home…", FILE, None, Nothing, "folder-plus"),
     c("create.blank", "New blank PDF", FILE, None, Nothing, "file-plus-2"),
+    c("measure.distance", "Measure distance", None, None, Annotate, "ruler"),
+    c("measure.perimeter", "Measure perimeter", None, None, Annotate, "ruler"),
+    c("measure.area", "Measure area", None, None, Annotate, "ruler"),
+    c("measure.scale", "Set measurement scale", None, None, Annotate, "ruler"),
+    c("measure.info", "Measurement information", None, None, Document, "ruler"),
+    c("measure.snap", "Measurement snapping", None, None, Document, "ruler"),
+    c("measure.export", "Export measurements as CSV", None, None, Document, "file-output"),
     c("page.copy", "Copy pages", None, None, Document, "copy"),
     c("page.cut", "Cut pages", None, None, Assembly, "scissors"),
     c("page.paste", "Paste pages", None, None, Assembly, "clipboard-paste"),
     c("create.file", "Create PDF from file…", FILE, None, Nothing, "file-input"),
+    c("create.multiple", "Create PDF from multiple files…", FILE, None, Nothing, "files"),
     c("create.images", "Create PDF from images…", FILE, None, Nothing, "image"),
     c("create.clipboard", "Create PDF from clipboard", FILE, None, Nothing, "copy-plus"),
     c("page.combine", "Combine files…", FILE, None, Nothing, "files"),
@@ -166,12 +179,25 @@ pub const COMMANDS: &[CommandSpec] = &[
     c("edit.find", "Find…", EDIT, Some(Shortcut::cmd("F")), Document, "search"),
     c("edit.advanced_search", "Advanced search…", EDIT, Some(Shortcut::cmd_shift("F")), Document, "search"),
     c("view.palette", "Find tools and commands…", VIEW, Some(Shortcut::cmd("K")), Nothing, "search"),
+    // Page display: View ▸ Page display and the rail's button list these as radios, so
+    // `menu = None` keeps them out of the generated menus. The palette still runs them.
+    c("view.layout.continuous", "Continuous scrolling", None, None, Document, "arrow-up-down"),
+    c("view.layout.single", "Single page", None, None, Document, "file-text"),
+    c("view.layout.two_up", "Two-page view", None, None, Document, "columns-2"),
+    c("view.layout.cover", "Show cover page in two-page view", None, None, TwoPageView, "bookmark"),
+    // Acrobat's view modes, a page display and a zoom at once (the rail's Page display menu).
+    c("view.fit_width_scrolling", "Fit to width scrolling", None, None, Document, "arrow-left-right"),
+    c("view.fit_one_page", "Fit one full page", None, None, Document, "maximize-2"),
     c("view.fit_visible", "Fit visible", VIEW, Some(Shortcut::cmd("3")), Document, "scan"),
     c("view.marquee_zoom", "Marquee zoom", VIEW, None, Document, "zoom-in"),
     c("edit.snapshot", "Take a snapshot", EDIT, None, Document, "camera"),
     c("view.full_screen", "Full screen mode", VIEW, Some(Shortcut::cmd("L")), Document, "maximize"),
     c("view.read_mode", "Read mode", VIEW, Some(Shortcut { command: true, shift: false, mac_ctrl: true, key: "H" }), Document, "book-open"),
-    c("view.theme", "Switch light / dark theme", VIEW, None, Nothing, "moon"),
+    c("view.focus_page_input", "Go to page…", VIEW, Some(Shortcut::cmd_shift("N")), Document, "text-cursor-input"),
+    c("view.theme", "Switch light / dark theme", None, None, Nothing, "moon"),
+    c("view.theme.system", "Use system setting", None, None, Nothing, "settings"),
+    c("view.theme.light", "Light gray", None, None, Nothing, "sun"),
+    c("view.theme.dark", "Dark gray", None, None, Nothing, "moon"),
     c("comment.list", "Comments panel", VIEW, None, Document, "message-square-text"),
     c("comment.note", "Add a sticky note", None, None, Annotate, "sticky-note"),
     c("comment.freetext", "Add a text box", None, None, Annotate, "type"),
@@ -323,7 +349,7 @@ pub fn is_enabled(spec: &CommandSpec, session: &Session, active: Option<DocId>) 
     let doc = active.and_then(|id| session.get(id));
     match spec.needs {
         Nothing => true,
-        Document => doc.is_some(),
+        Document | TwoPageView => doc.is_some(),
         Assembly => doc.is_some_and(|d| d.allows_assembly()),
         Modification => doc.is_some_and(|d| d.allows_modification()),
         Annotate => doc.is_some_and(|d| d.allows_annotation()),

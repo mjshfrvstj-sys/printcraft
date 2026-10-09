@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      test_macos:
+        description: Include macOS tests for an explicit cross-platform validation
+        type: boolean
+        default: false
   schedule:
     - cron: "17 3 * * *" # nightly fuzzing
 
@@ -23,12 +28,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Keep macOS off routine runs; allow explicit validation without a separate workflow.
+        os: ${{ fromJSON(inputs.test_macos == true && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
       # The optional craft-fonts build input (Japanese fonts), so the Japanese font tests run on
-      # Linux; macOS and Windows test the build without it. See craftrules standards/fonts.md.
+      # Linux; Windows tests the build without it. See craftrules standards/fonts.md.
       - name: Check out craft-fonts (Linux)
         if: runner.os == 'Linux'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

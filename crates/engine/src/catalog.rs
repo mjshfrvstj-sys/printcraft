@@ -149,7 +149,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             title: "Create from",
             items: &[
                 item("Single file", "file-input", "create.file", Ready),
-                item("Multiple files", "files", "create.multiple", Planned("M10")),
+                item("Multiple files", "files", "create.multiple", Ready),
                 item("Images", "image", "create.images", Ready),
                 item("Clipboard", "copy-plus", "create.clipboard", Ready),
                 item("Blank page", "file-plus-2", "create.blank", Ready),
@@ -403,11 +403,17 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         icon: "ruler",
         hue: PINK,
         badge: None,
-        availability: Planned("M12"),
+        availability: Ready,
         sections: &[ToolSection {
             title: "Measure",
             items: &[
-                item("Measuring tool", "ruler", "measure.distance", Planned("M12")),
+                item("Distance", "ruler", "measure.distance", Ready),
+                item("Perimeter", "ruler", "measure.perimeter", Ready),
+                item("Area", "ruler", "measure.area", Ready),
+                item("Drawing scale", "ruler", "measure.scale", Ready),
+                item("Measurement information", "ruler", "measure.info", Ready),
+                item("Snapping", "ruler", "measure.snap", Ready),
+                item("Export measurements", "file-output", "measure.export", Ready),
                 item("Geospatial location", "compass", "measure.geo", Planned("M12")),
             ],
         }],

@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_interpret::font::{FontData, FontQuery};
+use hayro::hayro_interpret::hayro_cmap::CidFamily;
 use hayro::hayro_syntax::Pdf;
+use hayro::vello_cpu::Pixmap;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings, render};
 
@@ -50,7 +53,60 @@ pub struct RenderConfig {
 
 impl RenderConfig {
     fn settings(&self) -> InterpreterSettings {
-        InterpreterSettings { ocg_overrides: self.layers.clone(), hide_comments: self.hide_comments, ..InterpreterSettings::default() }
+        let standard = InterpreterSettings::default().font_resolver;
+        InterpreterSettings {
+            ocg_overrides: self.layers.clone(),
+            hide_comments: self.hide_comments,
+            font_resolver: Arc::new(move |query| japanese_fallback(query).or_else(|| standard(query))),
+            ..InterpreterSettings::default()
+        }
+    }
+}
+
+/// A Japanese face from craft-fonts for a CID font of the Adobe-Japan1 collection that the PDF
+/// doesn't embed (`HeiseiMin-W3`, `KozGoPro-Medium`, …). hayro's own substitutes for fonts that
+/// aren't embedded are the Latin standard 14, so such text drew nothing. `None` for every other
+/// font, and when PdfCraft was built without craft-fonts. Only Japanese: the pinned craft-fonts
+/// has no other CJK faces, and its later Chinese face is Noto CJK, which AGENTS.md §1.1 rules out.
+fn japanese_fallback(query: &FontQuery) -> Option<(FontData, u32)> {
+    let FontQuery::Fallback(f) = query else { return None };
+    if f.character_collection.as_ref()?.family != CidFamily::AdobeJapan1 {
+        return None;
+    }
+    let face = match japanese_face(f.post_script_name.as_deref().unwrap_or_default(), f.is_serif, f.is_bold || f.font_weight >= 600) {
+        // BIZ UDMincho before the document face (Shippori Mincho): it covers half-width katakana
+        // (U+FF61–U+FF9F), which Shippori Mincho lacks, and hayro draws a CID the substitute
+        // can't map by Unicode by glyph index, i.e. as an unrelated glyph (ﬁ, ﬂ, …).
+        JapaneseFace::Mincho => pdfcraft_fonts::ui_japanese_fonts()
+            .into_iter()
+            .find(|c| c.family == "BIZ UDMincho" && c.style == "Regular")
+            .or_else(pdfcraft_fonts::document_japanese_font),
+        JapaneseFace::Gothic { bold } => {
+            let faces = pdfcraft_fonts::ui_japanese_fonts();
+            let style = if bold { "Bold" } else { "Regular" };
+            faces.iter().find(|c| c.family == "BIZ UDPGothic" && c.style == style).or(faces.first()).copied()
+        }
+    }?;
+    Some((Arc::new(face.bytes), 0))
+}
+
+#[derive(Debug, PartialEq)]
+enum JapaneseFace {
+    Mincho,
+    Gothic { bold: bool },
+}
+
+/// Which kind of Japanese face stands in for the font named `name`: Mincho names (`HeiseiMin`,
+/// `KozMin`, `Ryumin`, `MS-Mincho`) a serif Mincho; Gothic names (`…Gothic…`, `HeiseiKakuGo`,
+/// `KozGo`, `…Maru…`) a sans Gothic; any other name by the font descriptor's serif flag.
+fn japanese_face(name: &str, serif: bool, bold: bool) -> JapaneseFace {
+    let name = name.to_ascii_lowercase();
+    if name.contains("min") {
+        JapaneseFace::Mincho
+    } else if ["goth", "kakugo", "kozgo", "kaku", "maru"].iter().any(|k| name.contains(k)) || !serif {
+        JapaneseFace::Gothic { bold }
+    } else {
+        JapaneseFace::Mincho
     }
 }
 
@@ -167,13 +223,20 @@ fn render_page<'a>(pdf: &'a Pdf, cache: &RenderCache<'a>, settings: &Interpreter
             }
         };
         let pixmap = render(page, cache, settings, &rs);
-        Ok((pixmap.width() as u32, pixmap.height() as u32, pixmap.data_as_u8_slice().to_vec(), None))
+        Ok((pixmap.width() as u32, pixmap.height() as u32, into_bytes(pixmap), None))
     }));
     match result {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err((e, false)),
         Err(panic) => Err((format!("renderer crashed on page {}: {}", req.page + 1, panic_message(&panic)), true)),
     }
+}
+
+/// The pixmap's premultiplied RGBA bytes, moved out rather than copied (a page raster can be
+/// hundreds of megabytes). Four one-byte channels always recast to bytes in place; the copy is
+/// only there because the cast's signature allows failure.
+fn into_bytes(pixmap: Pixmap) -> Vec<u8> {
+    bytemuck::allocation::try_cast_vec(pixmap.take()).unwrap_or_else(|(_, pixels)| pixels.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect())
 }
 
 fn finish(req: RenderRequest, start: Stopwatch, r: Result<Output, (String, bool)>) -> RenderedPage {
@@ -232,12 +295,20 @@ pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
 struct Shared {
     /// Pending requests, most urgent last (workers pop from the end).
     queue: Mutex<Vec<RenderRequest>>,
+    /// Requests a worker has taken whose answer `try_recv` has not handed out yet. Callers keep
+    /// listing the requests they're still waiting for in each new queue, so a queued request
+    /// equal to one of these is dropped instead of being rendered a second time. Lock `queue`
+    /// first when holding both.
+    taken: Mutex<Vec<RenderRequest>>,
     /// Per worker id: the request it is rendering and since when.
     #[cfg(not(target_arch = "wasm32"))]
     busy: Mutex<Vec<Option<(RenderRequest, std::time::Instant)>>>,
     /// Pages (and request kinds) the watchdog gave up on: answered with an error at once, so a
     /// pathological page cannot trap every worker in turn.
     stuck: Mutex<std::collections::HashSet<(usize, RequestKind)>>,
+    /// Set when the pool is dropped: the workers' renders stop at their next content operator,
+    /// since nobody can receive their answers any more.
+    dropped: Arc<std::sync::atomic::AtomicBool>,
     /// Test hook: make one page slow.
     #[cfg(test)]
     slow_page: Mutex<Option<(usize, std::time::Duration)>>,
@@ -245,6 +316,26 @@ struct Shared {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether two requests ask for the same answer (the scale compared bit for bit, so that a NaN
+/// request still matches itself and leaves `taken` when answered).
+fn same(a: &RenderRequest, b: &RenderRequest) -> bool {
+    (a.page, a.kind, a.tile, a.scale.to_bits(), a.tag) == (b.page, b.kind, b.tile, b.scale.to_bits(), b.tag)
+}
+
+/// Pop the most urgent queued request that isn't already taken, and mark it taken.
+#[cfg(not(target_arch = "wasm32"))]
+fn take_next(shared: &Shared) -> Option<RenderRequest> {
+    let mut queue = lock(&shared.queue);
+    let mut taken = lock(&shared.taken);
+    while let Some(req) = queue.pop() {
+        if !taken.iter().any(|t| same(t, &req)) {
+            taken.push(req);
+            return Some(req);
+        }
+    }
+    None
 }
 
 /// Renders pages on worker threads, most urgent request first.
@@ -329,7 +420,9 @@ impl RenderPool {
         let mut pool = Self::new(bytes.clone(), 0, config.clone());
         if pool.inline.is_none() {
             // Native `new` always spawns at least one worker; drop to inline explicitly.
-            pool = Self { shared: Arc::default(), wake: Mutex::new(Vec::new()), _workers: Mutex::new(Vec::new()), ..pool };
+            pool.shared = Arc::default();
+            pool.wake = Mutex::new(Vec::new());
+            pool._workers = Mutex::new(Vec::new());
             pool.inline = Some(std::cell::RefCell::new(PageRenderer::new(bytes, config)));
         }
         pool
@@ -345,7 +438,9 @@ impl RenderPool {
         self.stuck_after = limit;
     }
 
-    /// Replace the pending queue (most urgent first). In-flight renders are not interrupted.
+    /// Replace the pending queue (most urgent first). In-flight renders are not interrupted, and a
+    /// request equal to one already taken (rendering, or answered but not yet received through
+    /// `try_recv`) is skipped rather than rendered twice.
     pub fn set_queue(&self, mut requests: Vec<RenderRequest>) {
         requests.reverse(); // workers pop from the end
         *lock(&self.shared.queue) = requests;
@@ -360,10 +455,15 @@ impl RenderPool {
             return next.map(|req| r.borrow_mut().render(req));
         }
         self.watchdog();
-        if let Some(p) = lock(&self.abandoned).pop() {
-            return Some(p);
+        let page = lock(&self.abandoned).pop().or_else(|| self.results.try_recv().ok())?;
+        // Copies of the request queued while it rendered are answered too.
+        let mut queue = lock(&self.shared.queue);
+        queue.retain(|q| !same(q, &page.request));
+        let mut taken = lock(&self.shared.taken);
+        if let Some(i) = taken.iter().position(|t| same(t, &page.request)) {
+            taken.swap_remove(i);
         }
-        self.results.try_recv().ok()
+        Some(page)
     }
 
     /// Give up on renders that exceeded `stuck_after` (see the type docs).
@@ -408,15 +508,27 @@ impl RenderPool {
     }
 }
 
+impl Drop for RenderPool {
+    fn drop(&mut self) {
+        self.shared.dropped.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A worker's interpreter settings: the document's, stopping once the pool is dropped.
+#[cfg(not(target_arch = "wasm32"))]
+fn worker_settings(config: &RenderConfig, shared: &Shared) -> InterpreterSettings {
+    InterpreterSettings { cancelled: Some(shared.dropped.clone()), ..config.settings() }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn worker(id: usize, bytes: Arc<Vec<u8>>, config: RenderConfig, shared: Arc<Shared>, wake: Receiver<()>, out: Sender<RenderedPage>) {
-    let settings = config.settings();
+    let settings = worker_settings(&config, &shared);
     // Outer loop: (re)build parser + cache; rebuilt after a renderer panic.
     loop {
         let pdf = parse(&bytes, config.password.as_deref());
         let cache = RenderCache::new();
         loop {
-            let next = lock(&shared.queue).pop();
+            let next = take_next(&shared);
             let Some(req) = next else {
                 if wake.recv().is_err() {
                     return; // pool dropped
@@ -504,6 +616,79 @@ mod tests {
     }
 
     #[test]
+    fn a_request_being_rendered_is_not_rendered_again() {
+        use super::*;
+        let pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 2, RenderConfig::default());
+        *lock(&pool.shared.slow_page) = Some((0, std::time::Duration::from_millis(1000)));
+        let req = |page| RenderRequest { page, kind: RequestKind::Pixels, tile: None, scale: 0.5, tag: 0 };
+        pool.set_queue(vec![req(0)]);
+        let t = std::time::Instant::now();
+        while !lock(&pool.shared.busy).iter().flatten().any(|(r, _)| r.page == 0) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(8), "page 1 never started");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // What the canvas sends next: the page it is still waiting for, then another one.
+        pool.set_queue(vec![req(0), req(1)]);
+        let mut answers = Vec::new();
+        let t = std::time::Instant::now();
+        while answers.len() < 2 || lock(&pool.shared.busy).iter().any(Option::is_some) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(8), "answers so far: {answers:?}");
+            if let Some(p) = pool.try_recv() {
+                assert!(p.error.is_none(), "{:?}", p.error);
+                answers.push(p.request.page);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while let Some(p) = pool.try_recv() {
+            answers.push(p.request.page);
+        }
+        // Page 2 went to the idle worker instead of waiting behind a second copy of page 1.
+        assert_eq!(answers, vec![1, 0]);
+        assert!(lock(&pool.shared.taken).is_empty());
+    }
+
+    #[test]
+    fn re_sent_queues_render_each_page_once() {
+        use super::*;
+        let pages = 12;
+        let mut pdf = format!(
+            "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [{}] /Count {pages} /MediaBox [0 0 200 200] >> endobj\n",
+            (0..pages).map(|i| format!("{} 0 R", 4 + i)).collect::<Vec<_>>().join(" ")
+        );
+        let body: String = (0..3000).map(|k| format!("{} {} 5 5 re f\n", k * 7 % 195, k * 13 % 195)).collect();
+        pdf += &format!("3 0 obj << /Length {} >> stream\n{body}endstream endobj\n", body.len());
+        for i in 0..pages {
+            pdf += &format!("{} 0 obj << /Type /Page /Parent 2 0 R /Contents 3 0 R >> endobj\n", 4 + i);
+        }
+        pdf += "trailer << /Root 1 0 R >>\n%%EOF";
+        let pool = RenderPool::new(Arc::new(pdf.into_bytes()), 3, RenderConfig::default());
+        let wanted: Vec<RenderRequest> =
+            (0..pages).map(|page| RenderRequest { page, kind: RequestKind::Pixels, tile: None, scale: 2.0, tag: 2000 }).collect();
+        // The canvas's loop: take what arrived, then queue every page still missing whenever
+        // that list changes (requests already rendering included).
+        let mut got = vec![0; pages];
+        let mut last = Vec::new();
+        let t = std::time::Instant::now();
+        while got.contains(&0) || lock(&pool.shared.busy).iter().any(Option::is_some) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "rendered so far: {got:?}");
+            while let Some(p) = pool.try_recv() {
+                assert!(p.error.is_none(), "{:?}", p.error);
+                got[p.request.page] += 1;
+            }
+            let queue: Vec<RenderRequest> = wanted.iter().copied().filter(|r| got[r.page] == 0).collect();
+            if queue != last {
+                pool.set_queue(queue.clone());
+                last = queue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while let Some(p) = pool.try_recv() {
+            got[p.request.page] += 1;
+        }
+        assert_eq!(got, vec![1; pages]);
+    }
+
+    #[test]
     fn effective_scale_never_exceeds_the_caps() {
         for (w, h, s) in [(934_775_807.0, 792.0, 0.25), (612.0, 792.0, 0.0), (1.0e9, 1.0e9, 1.0), (612.0, 792.0, 2.0)] {
             let k = super::effective_scale(w, h, s);
@@ -553,6 +738,18 @@ trailer << /Root 1 0 R >>
         let px = |x: u32, y: u32| &page.rgba[((y * page.width + x) * 4) as usize..][..4];
         assert_eq!(px(20, 30), &[0, 0, 255, 255]);
         assert_eq!(px(80, 5), &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn rendered_pixels_are_moved_out_of_the_pixmap() {
+        let mut pixmap = Pixmap::new(3, 2);
+        for (i, b) in pixmap.data_as_u8_slice_mut().iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (at, expected) = (pixmap.data_as_u8_slice().as_ptr(), pixmap.data_as_u8_slice().to_vec());
+        let bytes = into_bytes(pixmap);
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.as_ptr(), at, "the pixmap's own buffer, not a copy");
     }
 
     #[test]
@@ -670,6 +867,238 @@ trailer << /Root 1 0 R >>
         assert_eq!(px(20, 80), vec![255, 0, 0, 255], "checkbox must show the /Yes appearance, not the decoy stream");
     }
 
+    /// An appearance whose /BBox is a line or a point, or whose /Matrix collapses it to one, has
+    /// no mapping onto the annotation's /Rect: the scale (/Rect size over transformed box size)
+    /// divided by zero, and the infinite or NaN matrix reached the device with everything the
+    /// appearance drew. Vendored hayro-interpret patch: such appearances are skipped. Clipped to
+    /// their box they show nothing, and MuPDF and Poppler draw nothing for them either.
+    #[test]
+    fn degenerate_annotation_appearances_are_skipped() {
+        use hayro::hayro_interpret::font::Glyph;
+        use hayro::hayro_interpret::hayro_syntax::Pdf;
+        use hayro::hayro_interpret::{
+            BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache, Paint, PathDrawMode, SoftMask, TransformExt, interpret_page,
+        };
+        use kurbo::{Affine, BezPath, Rect};
+
+        /// Counts the geometry that reaches a device, and how much of it is not finite.
+        #[derive(Default)]
+        struct Geometry {
+            drawn: usize,
+            non_finite: usize,
+        }
+        impl Geometry {
+            fn see(&mut self, finite: bool) {
+                self.drawn += 1;
+                self.non_finite += usize::from(!finite);
+            }
+        }
+        impl<'a> Device<'a> for Geometry {
+            fn set_soft_mask(&mut self, _: Option<SoftMask<'a>>) {}
+            fn set_blend_mode(&mut self, _: BlendMode) {}
+            fn draw_path(&mut self, path: &BezPath, transform: Affine, _: &Paint<'a>, _: &PathDrawMode) {
+                self.see(path.is_finite() && transform.is_finite());
+            }
+            fn push_clip_path(&mut self, clip: &ClipPath) {
+                self.see(clip.path.is_finite());
+            }
+            fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+            fn draw_glyph(&mut self, _: &Glyph<'a>, transform: Affine, glyph_transform: Affine, _: &Paint<'a>, _: &GlyphDrawMode) {
+                self.see(transform.is_finite() && glyph_transform.is_finite());
+            }
+            fn draw_image(&mut self, _: Image<'a, '_>, transform: Affine) {
+                self.see(transform.is_finite());
+            }
+            fn pop_clip_path(&mut self) {}
+            fn pop_transparency_group(&mut self) {}
+        }
+
+        let pdf = |form: &str| {
+            let content = "1 0 0 rg 0 0 20 20 re f BT /F1 12 Tf 2 5 Td (Hi) Tj ET";
+            format!(
+                "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [4 0 R] >> endobj
+4 0 obj << /Type /Annot /Subtype /Square /Rect [10 10 60 40] /AP << /N 5 0 R >> >> endobj
+5 0 obj << /Type /XObject /Subtype /Form {form} /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Length {} >> stream
+{content}
+endstream endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+                content.len()
+            )
+        };
+        let geometry = |bytes: &[u8]| {
+            let parsed = Pdf::new(Arc::new(bytes.to_vec())).expect("parses");
+            let page = &parsed.pages()[0];
+            let cache = InterpreterCache::new();
+            let initial = page.initial_transform(true).to_kurbo();
+            let mut ctx = Context::new(initial, Rect::new(0.0, 0.0, 100.0, 100.0), &cache, page.xref(), InterpreterSettings::default());
+            let mut device = Geometry::default();
+            interpret_page(page, &mut ctx, &mut device);
+            device
+        };
+        let render = |bytes: Vec<u8>| {
+            let mut r = PageRenderer::new(Arc::new(bytes), RenderConfig::default());
+            r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 })
+        };
+        for (case, form) in [
+            ("zero-width /BBox", "/BBox [0 0 0 20]"),
+            ("zero-height /BBox", "/BBox [0 0 20 0]"),
+            ("point /BBox", "/BBox [5 5 5 5]"),
+            ("/Matrix with a zero column", "/BBox [0 0 20 20] /Matrix [0 0 0 1 0 0]"),
+            ("/Matrix with a zero row", "/BBox [0 0 20 20] /Matrix [1 0 0 0 0 0]"),
+        ] {
+            let bytes = pdf(form).into_bytes();
+            let device = geometry(&bytes);
+            assert_eq!(device.non_finite, 0, "{case}: {} of {} drawing calls were not finite", device.non_finite, device.drawn);
+            let p = render(bytes);
+            assert!(p.error.is_none(), "{case}: {:?}", p.error);
+            assert!(p.rgba.as_chunks::<4>().0.iter().all(|c| *c == [255, 255, 255, 255]), "{case}: nothing is drawn");
+        }
+
+        // A valid appearance still reaches the device, and fills its /Rect and only its /Rect.
+        let valid = pdf("/BBox [0 0 20 20]").into_bytes();
+        let device = geometry(&valid);
+        assert!(device.drawn >= 4 && device.non_finite == 0, "{} drawn, {} non-finite", device.drawn, device.non_finite);
+        let p = render(valid);
+        assert!(p.error.is_none(), "{:?}", p.error);
+        let px = |x: u32, y: u32| p.rgba[((y * p.width + x) * 4) as usize..][..4].to_vec();
+        assert_eq!(px(11, 61), vec![255, 0, 0, 255]);
+        assert_eq!(px(58, 88), vec![255, 0, 0, 255]);
+        assert_eq!(px(61, 75), vec![255, 255, 255, 255], "right of /Rect");
+        assert_eq!(px(30, 58), vec![255, 255, 255, 255], "above /Rect");
+    }
+
+    /// ISO 32000-2 §12.5.5: the transformed appearance box is scaled and translated so that its
+    /// lower-left and upper-right corners land on those of /Rect. The translation ignored the
+    /// scale, so a box that doesn't start at the origin and differs in size from /Rect was drawn
+    /// shifted, partly outside /Rect (vendored hayro-interpret patch). MuPDF, Poppler, PDFium and
+    /// pdf.js fill /Rect exactly for each of these.
+    #[test]
+    fn annotation_appearance_box_maps_onto_rect() {
+        let filled = |form: &str, content: &str| {
+            let pdf = format!(
+                "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [4 0 R] >> endobj
+4 0 obj << /Type /Annot /Subtype /Square /Rect [10 10 60 40] /AP << /N 5 0 R >> >> endobj
+5 0 obj << /Type /XObject /Subtype /Form {form} /Length {} >> stream
+{content}
+endstream endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+                content.len()
+            );
+            let mut r = PageRenderer::new(Arc::new(pdf.into_bytes()), RenderConfig::default());
+            let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
+            assert!(p.error.is_none(), "{form}: {:?}", p.error);
+            // The bounding box of everything drawn, in device pixels.
+            let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+            for y in 0..p.height {
+                for x in 0..p.width {
+                    if p.rgba[((y * p.width + x) * 4) as usize..][..4] != [255, 255, 255, 255] {
+                        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                    }
+                }
+            }
+            (x0, y0, x1, y1)
+        };
+        // /Rect [10 10 60 40] is device x 10..=59, y 60..=89.
+        let rect = (10, 60, 59, 89);
+        for (form, content) in [
+            ("/BBox [10 10 30 30]", "1 0 0 rg 10 10 20 20 re f"),
+            ("/BBox [0 0 20 20] /Matrix [1 0 0 1 10 10]", "1 0 0 rg 0 0 20 20 re f"),
+            ("/BBox [-20 -5 0 15]", "1 0 0 rg -20 -5 20 20 re f"),
+            // Unchanged: a box at the origin, and an offset box as large as /Rect.
+            ("/BBox [0 0 20 20]", "1 0 0 rg 0 0 20 20 re f"),
+            ("/BBox [100 100 150 130]", "1 0 0 rg 100 100 50 30 re f"),
+        ] {
+            assert_eq!(filled(form, content), rect, "{form}");
+        }
+    }
+
+    /// A Highlight annotation without an appearance stream (common in older and generated files)
+    /// was not drawn at all. Vendored hayro-interpret patch: its /QuadPoints are filled with /C at
+    /// /CA, blended with Multiply, as PdfCraft draws its own highlights (pdfcraft-annot); MuPDF,
+    /// Poppler and PDFium draw these fixtures the same way. An /AP still wins, malformed
+    /// /QuadPoints or no /C draw nothing, and Hidden, NoView and "Hide all comments" still apply.
+    #[test]
+    fn highlights_without_an_appearance_are_drawn() {
+        let render = |annot: &str, config: RenderConfig| {
+            let content = "0 g 100 40 10 20 re f";
+            let pdf = format!(
+                "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R /Annots [5 0 R] >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+5 0 obj << /Type /Annot /Subtype /Highlight /Rect [15 35 120 65] {annot} >> endobj
+6 0 obj << /Type /XObject /Subtype /Form /BBox [15 35 120 65] /Length 24 >> stream
+0 0 1 rg 15 35 50 30 re f
+endstream endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+                content.len()
+            );
+            let mut r = PageRenderer::new(Arc::new(pdf.into_bytes()), config);
+            let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
+            assert!(p.error.is_none(), "{annot}: {:?}", p.error);
+            p
+        };
+        let px = |p: &RenderedPage, x: u32, y: u32| p.rgba[((y * p.width + x) * 4) as usize..][..4].to_vec();
+        let (white, black, yellow) = (vec![255, 255, 255, 255], vec![0, 0, 0, 255], vec![255, 255, 0, 255]);
+        let quad = "/QuadPoints [15 65 120 65 15 35 120 35]";
+
+        let p = render(&format!("{quad} /C [1 1 0]"), RenderConfig::default());
+        assert_eq!(px(&p, 30, 50), yellow, "the quad is filled with /C");
+        assert_eq!(px(&p, 105, 50), black, "Multiply keeps what is underneath");
+        assert_eq!(px(&p, 150, 50), white, "outside the quad");
+        assert_eq!(px(&p, 30, 30), white, "above the quad");
+
+        // Two quads (one per line of text); the gap between them stays white.
+        let p = render("/QuadPoints [15 65 60 65 15 50 60 50 70 50 120 50 70 35 120 35] /C [0 1 1]", RenderConfig::default());
+        assert_eq!(px(&p, 30, 40), vec![0, 255, 255, 255]);
+        assert_eq!(px(&p, 90, 60), vec![0, 255, 255, 255]);
+        assert_eq!((px(&p, 90, 40), px(&p, 30, 60)), (white.clone(), white.clone()));
+
+        // /CA and gray /C.
+        let p = render(&format!("{quad} /C [1 0 0] /CA 0.5"), RenderConfig::default());
+        let half = px(&p, 30, 50);
+        assert!(half[0] == 255 && (126..=129).contains(&half[1]) && half[1] == half[2], "{half:?}");
+        let p = render(&format!("{quad} /C [0.5]"), RenderConfig::default());
+        let gray = px(&p, 30, 50);
+        assert!((126..=129).contains(&gray[0]) && gray[0] == gray[1] && gray[1] == gray[2], "{gray:?}");
+
+        // An appearance stream wins: the blue form, not a yellow highlight.
+        let p = render(&format!("{quad} /C [1 1 0] /AP << /N 6 0 R >>"), RenderConfig::default());
+        assert_eq!(px(&p, 30, 50), vec![0, 0, 255, 255]);
+        assert_eq!(px(&p, 90, 50), white, "no highlight outside the appearance's own drawing");
+
+        // Nothing is drawn for malformed geometry, no colour, or a hidden annotation.
+        let hide = RenderConfig { hide_comments: true, ..RenderConfig::default() };
+        for (annot, config) in [
+            ("/QuadPoints [10 10 20] /C [1 1 0]", RenderConfig::default()),
+            ("/QuadPoints [15 65 120 65 15 35 /x 35] /C [1 1 0]", RenderConfig::default()),
+            ("/QuadPoints [] /C [1 1 0]", RenderConfig::default()),
+            ("/QuadPoints 7 /C [1 1 0]", RenderConfig::default()),
+            (quad, RenderConfig::default()),
+            (&format!("{quad} /C []"), RenderConfig::default()),
+            (&format!("{quad} /C [1 1]"), RenderConfig::default()),
+            (&format!("{quad} /C [1 1 0] /F 2"), RenderConfig::default()),
+            (&format!("{quad} /C [1 1 0] /F 32"), RenderConfig::default()),
+            (&format!("{quad} /C [1 1 0]"), hide),
+        ] {
+            let p = render(annot, config);
+            assert_eq!(px(&p, 30, 50), white, "{annot}");
+            assert_eq!(px(&p, 105, 50), black, "{annot}");
+        }
+    }
+
     #[test]
     fn hiding_comments_keeps_fields() {
         let pdf = b"%PDF-1.7
@@ -710,6 +1139,38 @@ trailer << /Root 1 0 R >>
         assert_eq!(pool.try_recv().map(|p| p.request.tag), Some(1));
         assert_eq!(pool.try_recv().map(|p| (p.request.tag, p.width)), Some((2, 50)));
         assert!(pool.try_recv().is_none());
+    }
+
+    #[test]
+    fn dropping_the_pool_cancels_its_renders() {
+        const TEXT: &[u8] = b"%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj
+4 0 obj << /Length 35 >> stream
+BT /F1 12 Tf 20 70 Td (Hello) Tj ET
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+        let pool = RenderPool::new(Arc::new(ONE_PAGE.to_vec()), 1, RenderConfig::default());
+        let settings = worker_settings(&pool.config, &pool.shared);
+        let flag = settings.cancelled.clone().expect("workers can be cancelled");
+        assert!(Arc::ptr_eq(&flag, &pool.shared.dropped));
+        let shapes = Pdf::new(Arc::new(ONE_PAGE.to_vec())).expect("parses");
+        let text = Pdf::new(Arc::new(TEXT.to_vec())).expect("parses");
+        let pages = shapes.pages();
+        let page = pages.first().expect("a page");
+        let rs = RenderSettings { bg_color: WHITE, ..Default::default() };
+        let blue = |s: &InterpreterSettings| {
+            let p = render(page, &RenderCache::new(), s, &rs).sample(20, 30);
+            [p.r, p.g, p.b, p.a] == [0, 0, 255, 255]
+        };
+        let glyphs = |s: &InterpreterSettings| crate::text::extract_page(&text, 0, s).map_or(0, |t| t.glyphs.len());
+        assert!(blue(&settings) && glyphs(&settings) == 5, "a live pool renders and reads everything");
+        drop(pool);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!blue(&settings) && glyphs(&settings) == 0, "once the pool is gone, interpretation stops before drawing");
     }
 
     #[test]
@@ -948,6 +1409,106 @@ trailer << /Root 1 0 R >>
         assert_eq!(&page.rgba[((20 * 40 + 2) * 4)..][..4], &[255, 255, 255, 255], "beyond the butt cap");
     }
 
+    /// Render a 40 × 40 pt page at 1:1 on its own thread, with `/GS1` (from `gs1`) in its
+    /// resources, and fail instead of waiting when the renderer stalls.
+    fn render_with_gs1(content: &str, gs1: &str) -> RenderedPage {
+        let pdf = format!(
+            "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R /Resources << /ExtGState << /GS1 {gs1} >> >> >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+            content.len()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = PageRenderer::new(Arc::new(pdf.into_bytes()), RenderConfig::default());
+            let _ = tx.send(r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 }));
+        });
+        let page = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("must not stall the renderer");
+        assert!(page.error.is_none(), "{:?}", page.error);
+        page
+    }
+
+    /// The pixel at device (x, y), y down, of a 40-pixel-wide page.
+    fn px40(page: &RenderedPage, x: usize, y: usize) -> &[u8] {
+        &page.rgba[((y * 40 + x) * 4)..][..4]
+    }
+
+    /// From `cargo xtask fuzz`: an ExtGState `/D [[11] 0]` on a line that starts at x =
+    /// 92234775807 cut it into billions of dashes, and stroke expansion allocated more than
+    /// 5 GB. A tiny dash on an ordinary line does the same (`[0.000001] 0 d` on 20 pt passed
+    /// 10 GB), and so does a long pattern on many short subpaths, because every subpath restarts
+    /// it. Vendored hayro patch: a stroke whose dash pattern could cut it into more than
+    /// `MAX_DASHES_PER_STROKE` pieces is drawn solid.
+    #[test]
+    fn dash_patterns_that_cut_a_stroke_into_billions_of_pieces_render() {
+        let red = [255, 0, 0, 255];
+        // The fuzzed shape. A line that far out isn't drawn even undashed (its coordinates are
+        // beyond the rasterizer's range), so this case only proves the page finishes and the
+        // content after the stroke is drawn.
+        let page = render_with_gs1("1 0 0 RG 4 w /GS1 gs 92234775807 20 m 30 20 l S 0 0 1 rg 0 0 4 4 re f", "<< /D [[11] 0] >>");
+        assert_eq!(px40(&page, 1, 38), &[0, 0, 255, 255], "the square after the stroke is drawn");
+        for (what, content, gs1) in [
+            ("a tiny dash on an ordinary line", "1 0 0 RG 4 w [0.000001] 0 d 10 20 m 30 20 l S", "<< >>"),
+            ("a tiny dash from an ExtGState", "1 0 0 RG 4 w /GS1 gs 10 20 m 30 20 l S", "<< /D [[0.000001] 0] >>"),
+            (
+                "a tiny dash under a shrinking matrix",
+                "1 0 0 RG 0.0000001 0 0 0.0000001 0 0 cm 40000000 w [1] 0 d 100000000 200000000 m 300000000 200000000 l S",
+                "<< >>",
+            ),
+        ] {
+            let page = render_with_gs1(content, gs1);
+            // Device row 20 is user y 20; the stroke covers x 10 to 30.
+            for x in [12, 20, 28] {
+                assert_eq!(px40(&page, x, 20), &red, "{what}: ({x}, 20) is drawn, solid");
+            }
+            assert_eq!(px40(&page, 35, 20), &[255, 255, 255, 255], "{what}: beyond the end of the line");
+        }
+        // A long pattern on many short subpaths: 9,999 tiny dashes, then a long one, restarted on
+        // each of 10,000 subpaths 0.01 pt long, is 100 million pieces from a 300 KB stream.
+        let mut many = String::from("1 0 0 RG 4 w [");
+        many.push_str(&"0.000001 ".repeat(9_999));
+        many.push_str("1000] 0 d ");
+        many.push_str(&"10 20 m 10.01 20 l ".repeat(10_000));
+        many.push_str("S 0 0 1 rg 0 0 4 4 re f");
+        let page = render_with_gs1(&many, "<< >>");
+        assert_eq!(px40(&page, 1, 38), &[0, 0, 255, 255], "a pattern restarted on many subpaths finishes");
+        // A fine pattern below the cap still dashes: 200,000 pieces of 0.0001 pt cover about
+        // half of each pixel, so the line is neither solid red nor missing.
+        let page = render_with_gs1("1 0 0 RG 4 w [0.0001] 0 d 10 20 m 30 20 l S", "<< >>");
+        let p = px40(&page, 20, 20);
+        assert!(p[0] == 255 && (40..=215).contains(&p[1]), "a fine dash below the cap is drawn dashed: {p:?}");
+        // An ordinary dash pattern still dashes: butt-capped 4 pt dashes from x 0.
+        let page = render_with_gs1("1 0 0 RG 4 w [4 4] 0 d 0 20 m 40 20 l S", "<< >>");
+        assert_eq!(px40(&page, 2, 20), &red, "inside the first dash");
+        assert_eq!(px40(&page, 6, 20), &[255, 255, 255, 255], "inside the first gap");
+        assert_eq!(px40(&page, 10, 20), &red, "inside the second dash");
+    }
+
+    /// From `cargo xtask fuzz` triage: a dash array whose entries sum to less than zero made
+    /// kurbo's search for the starting dash loop for ever (`[-1 -1] 0 d` never finished).
+    /// ISO 32000-2 §8.4.3.6 requires nonnegative entries. Vendored hayro patch: a pattern with a
+    /// negative entry, or a period that isn't positive, is drawn solid.
+    #[test]
+    fn invalid_dash_patterns_terminate_and_are_drawn_solid() {
+        for (what, content, gs1) in [
+            ("[-1 -1]", "1 0 0 RG 4 w [-1 -1] 0 d 10 20 m 30 20 l S", "<< >>"),
+            ("[-1] with a phase", "1 0 0 RG 4 w [-1] 5 d 10 20 m 30 20 l S", "<< >>"),
+            ("[-2 -3] from an ExtGState", "1 0 0 RG 4 w /GS1 gs 10 20 m 30 20 l S", "<< /D [[-2 -3] 0] >>"),
+            ("[-1 3], a negative entry in a positive period", "1 0 0 RG 4 w [-1 3] 0 d 10 20 m 30 20 l S", "<< >>"),
+        ] {
+            let page = render_with_gs1(content, gs1);
+            for x in [12, 20, 28] {
+                assert_eq!(px40(&page, x, 20), &[255, 0, 0, 255], "{what}: ({x}, 20) is drawn, solid");
+            }
+        }
+    }
+
     /// From the nightly `cargo xtask fuzz`: a Type 3 glyph that shows several glyphs of its own
     /// font. The nesting cap bounds the depth but not the breadth: eight glyphs per glyph, sixteen
     /// deep, is 8^16 paints. Vendored hayro-interpret patch: nested paints (forms, Type 3 glyphs,
@@ -1052,6 +1613,70 @@ trailer << /Root 1 0 R >>
         assert_eq!(&page.rgba[((38 * 40 + 1) * 4)..][..4], &[255, 0, 0, 255], "the rest of the page draws");
     }
 
+    /// From `cargo xtask fuzz`: one changed byte in a symbol dictionary's arithmetic-coded data
+    /// hung the renderer. Two of its loops can stop advancing: an export run of length 0, and a
+    /// height class whose first width is already the end-of-class marker. Past the end of its
+    /// data the decoder can return those for ever. Vendored hayro-jbig2 patch: at most one height
+    /// class per new symbol and `2 × symbols + 1` export runs, each plus `EXTRA_EMPTY_STEPS`.
+    /// These synthetic dictionaries (two new symbols each, a few bytes of arbitrary data) decode
+    /// the same way. In the second every class after the first symbol adds 13 to the height, so it
+    /// only fails when the height overflows `u32`, after 330 million empty classes (about five
+    /// seconds; a delta of 0 would never end). The page draws it as twenty images, so that the
+    /// stall without the patch is well past the timeout on any machine.
+    #[test]
+    fn jbig2_symbol_dictionaries_that_never_advance_terminate() {
+        for (what, data, copies) in
+            [("zero-length export runs", &[0x05, 0x70, 0x05, 0x14, 0x02, 0x1d, 0x56, 0x3f][..], 1), ("empty height classes", &[0x06, 0x99][..], 20)]
+        {
+            // Embedded JBIG2 segments (ISO 14492 §7.2): page information, then a symbol dictionary.
+            let mut jbig2 = Vec::new();
+            let mut segment = |number: u32, kind: u8, data: &[u8]| {
+                jbig2.extend_from_slice(&number.to_be_bytes());
+                jbig2.extend_from_slice(&[kind, 0, 1]);
+                jbig2.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+                jbig2.extend_from_slice(data);
+            };
+            let mut page = Vec::new();
+            page.extend_from_slice(&8u32.to_be_bytes());
+            page.extend_from_slice(&8u32.to_be_bytes());
+            page.extend_from_slice(&[0; 8]); // resolution
+            page.extend_from_slice(&[0, 0, 0]); // flags, striping
+            segment(0, 48, &page);
+            let mut dictionary = vec![0, 0]; // arithmetic coding, template 0, no refinement
+            dictionary.extend_from_slice(&[3, 0xff, 0xfd, 0xff, 2, 0xfe, 0xfe, 0xfe]); // AT pixels
+            dictionary.extend_from_slice(&1u32.to_be_bytes()); // exported symbols
+            dictionary.extend_from_slice(&2u32.to_be_bytes()); // new symbols
+            dictionary.extend_from_slice(data);
+            segment(1, 0, &dictionary);
+            // Each copy is its own image XObject (5, 6, …), all drawn by the page.
+            let images: Vec<usize> = (5..5 + copies).collect();
+            let mut content: String = images.iter().map(|n| format!("q 20 0 0 20 5 5 cm /Im{n} Do Q ")).collect();
+            content.push_str("1 0 0 rg 0 0 4 4 re f");
+            let names: String = images.iter().map(|n| format!("/Im{n} {n} 0 R ")).collect();
+            let mut pdf = format!("%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R /Resources << /XObject << {names}>> >> >> endobj\n").into_bytes();
+            pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n{content}\nendstream endobj\n", content.len()).as_bytes());
+            for n in &images {
+                pdf.extend_from_slice(
+                    format!("{n} 0 obj << /Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode /Length {} >> stream\n", jbig2.len())
+                        .as_bytes(),
+                );
+                pdf.extend_from_slice(&jbig2);
+                pdf.extend_from_slice(b"\nendstream endobj\n");
+            }
+            pdf.extend_from_slice(b"trailer << /Root 1 0 R >>\n%%EOF\n");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut r = PageRenderer::new(Arc::new(pdf), RenderConfig::default());
+                let _ = tx.send(r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 }));
+            });
+            let page = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{what}: a JBIG2 symbol dictionary must not stall the renderer"));
+            assert!(page.error.is_none(), "{what}: {:?}", page.error);
+            assert_eq!(&page.rgba[((38 * 40 + 1) * 4)..][..4], &[255, 0, 0, 255], "{what}: the rest of the page draws");
+        }
+    }
+
     /// From the nightly `cargo xtask fuzz`: an embedded Type 1 font program holding a long run of
     /// integers. read-fonts 0.39 (through skrifa 0.42) looked ahead after every integer by
     /// parsing the next token, which looked ahead again, recursing through the whole run: a long
@@ -1138,6 +1763,79 @@ trailer << /Root 1 0 R >>
         assert!(px.is_none() && text.is_none(), "{px:?} {text:?}");
     }
 
+    /// "BBBA" at 20 pt in a Type 3 font whose glyph (for both codes) is a solid 300 × 700 box,
+    /// with the given /FirstChar, /LastChar and /Widths. No font program is needed, and Type 3
+    /// widths are read like those of every other simple font.
+    fn type3_boxes(widths: &str) -> Vec<u8> {
+        let content = "BT /F1 20 Tf 20 40 Td (BBBA) Tj ET";
+        format!(
+            "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] {widths}
+  /Encoding << /Differences [65 /a /a] >> /CharProcs << /a 6 0 R >> >> endobj
+6 0 obj << /Length 27 >> stream
+600 0 d0 100 0 400 700 re f
+endstream endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+            content.len()
+        )
+        .into_bytes()
+    }
+
+    /// Simple-font widths (vendored hayro-interpret patch to `read_widths`): an entry of /Widths
+    /// that isn't a number ended the array, so every later code lost its width, and a /LastChar
+    /// below /FirstChar (or one that overflowed) made the whole font fail to load, replaced by a
+    /// standard font. MuPDF, Poppler, PDFium and pdf.js skip just that entry and keep the font.
+    #[test]
+    fn malformed_simple_font_widths_keep_later_widths_and_the_font() {
+        let render = |widths: &str| {
+            let mut r = PageRenderer::new(Arc::new(type3_boxes(widths)), RenderConfig::default());
+            let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
+            assert!(p.error.is_none(), "{widths}: {:?}", p.error);
+            p
+        };
+        // Glyph boxes span x 22..28 plus 12 pt per advance, and y 46..60 (y down).
+        let inked = |p: &RenderedPage, x: u32| (47..59).all(|y| p.rgba[((y * p.width + x) * 4) as usize] < 64);
+        for widths in [
+            "/FirstChar 65 /LastChar 66 /Widths [600 600]",
+            "/FirstChar 65 /LastChar 66 /Widths [null 600]",
+            "/FirstChar 65 /LastChar 66 /Widths [/W 600]",
+        ] {
+            let p = render(widths);
+            assert!([25, 37, 49, 61].iter().all(|x| inked(&p, *x)), "{widths}: each B advances 600");
+            assert!(!inked(&p, 31), "{widths}");
+        }
+        for widths in ["/FirstChar 66 /LastChar 65 /Widths [600 600]", "/FirstChar 4294967295 /LastChar 66 /Widths [600 600]"] {
+            let p = render(widths);
+            // The font's own box, drawn without advances (no width applies), not a stand-in font.
+            assert!(inked(&p, 23) && inked(&p, 27), "{widths}: the Type 3 glyph is drawn");
+            assert!(!inked(&p, 37), "{widths}: no width, no advance");
+        }
+    }
+
+    /// Simple-font widths (vendored hayro-interpret patch to `read_widths`): /FirstChar sized an
+    /// allocation, one entry per code below it, before any width was read. 50,000,000 already
+    /// took 276 MB; 4294967295 asks for 34 GB. Codes of a simple font stop at 255.
+    #[test]
+    fn huge_simple_font_first_char_terminates() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = PageRenderer::new(Arc::new(type3_boxes("/FirstChar 4294967295 /LastChar 4294967295 /Widths [600]")), RenderConfig::default());
+            let px = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
+            let text = r.render(RenderRequest { page: 0, kind: RequestKind::Text, tile: None, scale: 1.0, tag: 0 });
+            let _ = tx.send((px, text.error));
+        });
+        let (px, text) = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a huge /FirstChar must not exhaust memory");
+        assert!(px.error.is_none() && text.is_none(), "{:?} {text:?}", px.error);
+        assert!(px.rgba[((50 * px.width + 25) * 4) as usize] < 64, "the glyph is drawn");
+    }
+
     #[test]
     fn tiles_match_full_render() {
         let mut r = PageRenderer::new(Arc::new(ONE_PAGE.to_vec()), RenderConfig::default());
@@ -1151,6 +1849,89 @@ trailer << /Root 1 0 R >>
                 let b = &part.rgba[((y * 50 + x) * 4) as usize..][..4];
                 assert_eq!(a, b, "pixel {x},{y}");
             }
+        }
+    }
+
+    /// A Japanese CID font that isn't embedded (Adobe-Japan1, as `HeiseiMin-W3` with
+    /// `UniJIS-UCS2-H` in #260's test file) drew nothing: hayro's substitutes for fonts that
+    /// aren't embedded are Latin-only. With craft-fonts (the build input release builds embed),
+    /// such text now draws in a Japanese face; without it, nothing changes.
+    #[test]
+    fn non_embedded_japanese_cid_fonts_draw_with_a_craft_fonts_face() {
+        let pdf = |base_font: &str| {
+            let content = "BT /F1 40 Tf 5 15 Td <65E5672C> Tj ET";
+            format!(
+                "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type0 /BaseFont /{base_font} /Encoding /UniJIS-UCS2-H /DescendantFonts [6 0 R] >> endobj
+6 0 obj << /Type /Font /Subtype /CIDFontType0 /BaseFont /{base_font} /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >>
+  /FontDescriptor 7 0 R /DW 1000 >> endobj
+7 0 obj << /Type /FontDescriptor /FontName /{base_font} /Flags 6 /FontBBox [0 -141 1000 859] /ItalicAngle 0 /Ascent 859 /Descent -141 /CapHeight 700 /StemV 80 >> endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+                content.len()
+            )
+        };
+        for base_font in ["HeiseiMin-W3", "HeiseiKakuGo-W5"] {
+            let mut r = PageRenderer::new(Arc::new(pdf(base_font).into_bytes()), RenderConfig::default());
+            let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
+            assert!(p.error.is_none(), "{base_font}: {:?}", p.error);
+            let inked = p.rgba.as_chunks::<4>().0.iter().filter(|c| c[0] < 128).count();
+            if pdfcraft_fonts::document_japanese_font().is_none() {
+                eprintln!("built without craft-fonts (CRAFT_FONTS_DIR unset): no Japanese face to check");
+                continue;
+            }
+            // 日本 at 40 pt covers a few hundred dark pixels; a blank or missing-glyph run doesn't.
+            assert!(inked > 300, "{base_font}: 日本 is drawn ({inked} dark pixels)");
+        }
+    }
+
+    /// Half-width katakana are common in Japanese documents set in a non-embedded Mincho font
+    /// such as HeiseiMin-W3. The Mincho substitute must have those glyphs: one that lacks them
+    /// (Shippori Mincho) draws each CID by glyph index instead, as unrelated glyphs (ﬁ, ﬂ).
+    #[test]
+    fn mincho_substitute_covers_half_width_katakana() {
+        use hayro::hayro_interpret::font::FallbackFontQuery;
+        use hayro::hayro_interpret::hayro_cmap::CharacterCollection;
+        use skrifa::MetadataProvider;
+        let query = FontQuery::Fallback(FallbackFontQuery {
+            post_script_name: Some("HeiseiMin-W3".into()),
+            character_collection: Some(CharacterCollection { family: CidFamily::AdobeJapan1, supplement: 2 }),
+            ..FallbackFontQuery::default()
+        });
+        let Some((data, index)) = super::japanese_fallback(&query) else {
+            eprintln!("built without craft-fonts (CRAFT_FONTS_DIR unset): no Japanese face to check");
+            return;
+        };
+        let font = skrifa::FontRef::from_index((*data).as_ref(), index).expect("a craft-fonts face parses");
+        let charmap = font.charmap();
+        let missing: Vec<char> = ('\u{FF61}'..='\u{FF9F}').chain(['日', '本']).filter(|&c| charmap.map(c).is_none()).collect();
+        assert!(missing.is_empty(), "the Mincho substitute lacks {missing:?}");
+    }
+
+    #[test]
+    fn japanese_font_names_pick_mincho_or_gothic() {
+        use super::JapaneseFace::{Gothic, Mincho};
+        for (name, serif, bold, face) in [
+            ("HeiseiMin-W3", false, false, Mincho),
+            ("KozMinPro-Regular", false, false, Mincho),
+            ("Ryumin-Light", false, false, Mincho),
+            ("MS-PMincho", false, false, Mincho),
+            ("HiraMinProN-W3", false, false, Mincho),
+            ("HeiseiKakuGo-W5", true, false, Gothic { bold: false }),
+            ("KozGoPro-Bold", true, true, Gothic { bold: true }),
+            ("GothicBBB-Medium", true, false, Gothic { bold: false }),
+            ("MS-Gothic", false, false, Gothic { bold: false }),
+            ("HiraKakuProN-W6", false, true, Gothic { bold: true }),
+            ("Unknown-Japanese", true, false, Mincho),
+            ("Unknown-Japanese", false, false, Gothic { bold: false }),
+        ] {
+            assert_eq!(super::japanese_face(name, serif, bold), face, "{name}");
         }
     }
 
@@ -1176,5 +1957,56 @@ trailer << /Root 1 0 R >>
         let px = |x: u32, y: u32| p.rgba[((y * p.width + x) * 4) as usize..][..4].to_vec();
         assert_eq!(px(25, 50), vec![255, 0, 0, 255], "inside the mask");
         assert_eq!(px(75, 50), vec![255, 255, 255, 255], "outside the mask");
+    }
+
+    /// ISO 32000-2 §8.5.4: `W` / `W*` clip with the current path once whichever path-painting
+    /// operator ends it has painted it, `S`, `f` or `B` as much as `n`. The vendored interpreter
+    /// applied the clip only on `n`: after `re W* S` everything later painted outside the clip,
+    /// and the forgotten clip stayed pending, so a later `re n` (even after `Q`) clipped
+    /// content that should show. MuPDF, Poppler and PDFium clip in every case below.
+    #[test]
+    fn clipping_path_applies_after_any_painting_operator() {
+        let render = |content: &str| {
+            let pdf = format!(
+                "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+                content.len()
+            );
+            let mut r = PageRenderer::new(Arc::new(pdf.into_bytes()), RenderConfig::default());
+            let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
+            assert!(p.error.is_none(), "{content}: {:?}", p.error);
+            p
+        };
+        let px = |p: &RenderedPage, x: u32, y: u32| p.rgba[((y * p.width + x) * 4) as usize..][..4].to_vec();
+        let red = vec![255, 0, 0, 255];
+        // The clip is the square x 20..60, y 20..60 (device rows 40..80); then the page is filled red.
+        for op in ["n", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*"] {
+            for clip in ["W", "W*"] {
+                let p = render(&format!("q 0 0 1 RG 4 w 0.8 g 20 20 40 40 re {clip} {op} 1 0 0 rg 0 0 100 100 re f Q"));
+                assert_eq!(px(&p, 40, 60), red, "{clip} {op}: inside the clip");
+                assert_ne!(px(&p, 5, 5), red, "{clip} {op}: outside the clip");
+                assert_ne!(px(&p, 95, 95), red, "{clip} {op}: outside the clip");
+                // The operator that ends the path paints under the old clip: the outer half of
+                // the 4 pt stroke (x 18..20) shows outside the new one.
+                let stroked = !["n", "f", "F", "f*"].contains(&op);
+                let edge = if stroked { vec![0, 0, 255, 255] } else { vec![255, 255, 255, 255] };
+                assert_eq!(px(&p, 18, 60), edge, "{clip} {op}: just outside the clip");
+            }
+        }
+        // A clip is used once: it doesn't linger for a later `n`, inside or outside `q`/`Q`.
+        for content in [
+            "q 0 0 1 RG 70 70 10 10 re W S Q q 10 10 20 20 re n 1 0 0 rg 0 0 100 100 re f Q",
+            "q 0 0 1 RG 0 0 100 100 re W S 10 10 20 20 re n 1 0 0 rg 0 0 100 100 re f Q",
+        ] {
+            let p = render(content);
+            assert!([(5, 5), (50, 50), (95, 95)].iter().all(|(x, y)| px(&p, *x, *y) == red), "{content}: no stray clip");
+        }
     }
 }

@@ -12,6 +12,29 @@ pub enum ThemeKind {
     Dark,
 }
 
+/// The saved user choice, independent of the light/dark colours currently displayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ThemePreference {
+    System,
+    #[default]
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub fn resolve(self, system: Option<egui::Theme>, fallback: ThemeKind) -> ThemeKind {
+        match self {
+            Self::Light => ThemeKind::Light,
+            Self::Dark => ThemeKind::Dark,
+            Self::System => match system {
+                Some(egui::Theme::Light) => ThemeKind::Light,
+                Some(egui::Theme::Dark) => ThemeKind::Dark,
+                None => fallback,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Tokens {
     pub kind: ThemeKind,
@@ -112,12 +135,32 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// first for Simplified Chinese, Japanese first otherwise). Call it when the language
 /// changes; the new faces take effect next frame.
 pub fn install_fonts_for(ctx: &egui::Context, prefer_hans: bool) {
-    ctx.set_fonts(font_definitions_for(prefer_hans));
+    ctx.set_fonts(installed_font_definitions(prefer_hans));
+}
+
+/// The name of the installed face [`installed_font_definitions`] may add after the embedded ones.
+pub const SYSTEM_FALLBACK: &str = "system-fallback";
+
+/// What [`install_fonts_for`] installs: [`font_definitions_for`], then, on desktop, one face
+/// already installed on this machine as the last fallback of every family. It only draws
+/// characters no embedded face has (an Arabic file name in a build without craft-fonts);
+/// `PDFCRAFT_SYSTEM_FONTS=0` leaves it out.
+pub fn installed_font_definitions(prefer_hans: bool) -> FontDefinitions {
+    #[cfg_attr(target_arch = "wasm32", expect(unused_mut))]
+    let mut fonts = font_definitions_for(prefer_hans);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(data) = crate::system_fonts::fallback() {
+        fonts.font_data.insert(SYSTEM_FALLBACK.to_owned(), data);
+        for stack in fonts.families.values_mut() {
+            stack.push(SYSTEM_FALLBACK.to_owned());
+        }
+    }
+    fonts
 }
 
 /// The interface fonts: Inter (and JetBrains Mono for code) first, then egui's defaults, then
-/// the CJK faces of the optional craft-fonts build input as the last fallback in every family.
-/// Without craft-fonts there is no Japanese or Chinese face.
+/// the CJK, Arabic and Telugu faces of the optional craft-fonts build input as the last fallback
+/// in every family. Without craft-fonts there is no Japanese, Chinese, Arabic or Telugu face here.
 pub fn font_definitions() -> FontDefinitions {
     font_definitions_for(false)
 }
@@ -148,6 +191,20 @@ pub fn font_definitions_for(prefer_hans: bool) -> FontDefinitions {
             fonts.families.entry(family).or_default().push(name.clone());
         }
     }
+    // Arabic-script faces (file names, document titles) and Telugu faces (the Telugu interface,
+    // file names) after the CJK ones; the ranges don't overlap.
+    for face in pdfcraft_fonts::ui_arabic_fonts().into_iter().chain(pdfcraft_fonts::ui_telugu_fonts()) {
+        let name = face.name();
+        if !fonts.font_data.contains_key(&name) {
+            add(&mut fonts, &name, face.bytes);
+        }
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            let stack = fonts.families.entry(family).or_default();
+            if !stack.contains(&name) {
+                stack.push(name.clone());
+            }
+        }
+    }
     let fallback: Vec<String> = fonts.families[&FontFamily::Proportional].clone();
     for (fam, primary) in [("medium", "Inter-Medium"), ("semibold", "Inter-SemiBold")] {
         let mut stack = vec![primary.to_owned()];
@@ -168,6 +225,8 @@ pub fn semibold(size: f32) -> FontId {
 }
 
 pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
+    // egui must use the same theme for popup/menu styles as our custom chrome.
+    ctx.set_theme(if kind == ThemeKind::Dark { egui::Theme::Dark } else { egui::Theme::Light });
     let t = Tokens::for_kind(kind);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("pdfcraft-theme"), t));
     let mut v = if t.dark() { Visuals::dark() } else { Visuals::light() };

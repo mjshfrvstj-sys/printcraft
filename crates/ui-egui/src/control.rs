@@ -26,6 +26,8 @@
 //! - `ui.set {key, value}`: view options (`--page`, `--zoom`, …), plus persistent preferences.
 //!   `default-mode=all|read|edit|convert|sign` applies to future PDF opens; `mode` overrides it
 //!   for this session without changing the saved preference. `ui.state.default_mode` reports it.
+//!   `theme=light|dark|system` changes the saved theme preference; `ui.state.theme_preference`
+//!   reports the choice and `ui.state.theme` reports the resolved light/dark colours.
 //! - `ui.open {path}`: open a file.
 //! - `ui.screenshot {region?}`: PNG of the window (base64), optionally cropped to a rect.
 
@@ -551,6 +553,8 @@ impl Host for crate::PdfCraftApp {
                 "fit": format!("{:?}", v.fit),
                 "layout": format!("{:?}", v.layout),
                 "organize": v.organize,
+                // Pages picked in the organize grid or the Pages panel (empty: the current page).
+                "selected_pages": v.selected.iter().map(|p| p + 1).collect::<Vec<_>>(),
                 "auto_scrolling": v.auto_scrolling(),
                 "viewport": [v.viewport_rect().min.x, v.viewport_rect().min.y, v.viewport_rect().max.x, v.viewport_rect().max.y],
                 "find_open": v.find.is_some(),
@@ -561,6 +565,7 @@ impl Host for crate::PdfCraftApp {
                 "comment_composer_open": v.comments.composer.is_some(),
             })),
             "quick_tool": match self.quick_tool {
+                crate::QuickTool::Measure(t) => format!("measure-{}", t.name()),
                 crate::QuickTool::Select => "select".to_string(),
                 crate::QuickTool::Hand => "hand".to_string(),
                 crate::QuickTool::Crop => "crop".to_string(),
@@ -586,8 +591,10 @@ impl Host for crate::PdfCraftApp {
             "dialog": self.dialog.map(|d| format!("{d:?}")),
             "palette_open": self.palette_open,
             "theme": format!("{:?}", self.theme),
+            "theme_preference": self.theme_preference,
             "language": self.language,
             "notice": self.toast.as_ref().map(|t| t.0.clone()),
+            "progress": self.progress_notice.as_ref().map(|p| json!({ "label": p.label, "fraction": p.fraction })),
             "password_prompt": self.password_prompt.is_some(),
             "close_prompt": self.close_request.is_some(),
         })

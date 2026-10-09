@@ -1,11 +1,13 @@
 //! PdfCraft desktop app.
 //!
 //! Usage: `pdfcraft [options] [files…]`
+//! `--create-images [images…]` stages the images in one PDF and asks for the page DPI.
 //!
 //! View options (applied after the files open; also the seed of the UI control channel):
 //! `--page N  --zoom 150  --layout continuous|two-up|single  --panel comments|bookmarks|pages|fields|layers|attachments|none
-//!  --theme light|dark  --language auto|<code>  --mode all|read|edit|convert|sign  --tool <catalogue id>  --left open|closed
-//!  --organize on  --fields on  --dialog properties|shortcuts|about  --palette <query>  --home on`
+//!  --theme light|dark|system  --language auto|<code>  --mode all|read|edit|convert|sign  --tool <catalogue id>  --left open|closed
+//!  --organize on  --fields on  --dialog properties|shortcuts|about  --palette <query>  --home on
+//!  --cover on|off  --default-layout continuous|two-up|single  --default-zoom fit-width|fit-page|<percent>`
 //!
 //! `--control <file>` enables the UI control channel (off by default): the app listens on a random
 //! loopback port and writes `{"port", "token", "pid"}` to `<file>` (owner-only permissions).
@@ -21,6 +23,7 @@ use pdfcraft_ui_egui::PdfCraftApp;
 
 #[cfg(target_os = "macos")]
 mod apple_events;
+mod logging;
 #[cfg(any(windows, test))]
 mod open_protocol;
 mod updates;
@@ -40,11 +43,25 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256
 /// The app was called PrintCraft before; settings saved then are under this key.
 const LEGACY_STORAGE_KEY: &str = "printcraft";
 
+/// The settings folder: `app.ron` and the `logs` folder (docs/development.md). In portable mode
+/// it is `PdfCraftData` beside the executable (#157). eframe would otherwise derive it from the
+/// app id; keep it under "PdfCraft".
+fn settings_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = pdfcraft_ui_egui::portable::data_dir() {
+        return Some(dir.to_path_buf());
+    }
+    eframe::storage_dir("PdfCraft")
+}
+
 /// Move the settings and crash-recovery folders of the app's former name, PrintCraft, to the new
 /// name once, so an upgrade keeps recent files, preferences and unsaved work. Best effort: a
-/// folder is left alone when the new one already exists or the move fails.
+/// folder is left alone when the new one already exists or the move fails. A portable copy leaves
+/// the per-user folders alone.
 fn migrate_legacy_folders() {
-    let mut moves = vec![(eframe::storage_dir("PrintCraft"), eframe::storage_dir("PdfCraft"))];
+    if pdfcraft_ui_egui::portable::data_dir().is_some() {
+        return;
+    }
+    let mut moves = vec![(eframe::storage_dir("PrintCraft"), settings_dir())];
     // Recovery lives in the settings folder except on Windows, where it is under %LOCALAPPDATA%.
     if cfg!(windows) {
         let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
@@ -62,25 +79,68 @@ fn migrate_folders(moves: impl IntoIterator<Item = (Option<std::path::PathBuf>, 
         if let Some(parent) = new.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::rename(&old, &new) {
-            eprintln!("pdfcraft: moving {} to {}: {e}", old.display(), new.display());
+        match std::fs::rename(&old, &new) {
+            Ok(()) => log::info!("moved {} to {}", old.display(), new.display()),
+            Err(e) => log::warn!("moving {} to {}: {e}", old.display(), new.display()),
         }
     }
 }
 
+/// Desktop launchers (GNOME Files, KDE Dolphin…) only recognise an app as the default handler for a
+/// mime type if its `Exec` takes URIs (`%u`/`%U`), not just paths (`%F`); the packaged `.desktop`
+/// file uses `%U` accordingly (packaging/linux/ai.storyteller.pdfcraft.desktop). Decode a local
+/// `file://` argument (`file:///path` or `file://localhost/path`) to a plain path here so the rest
+/// of the app, which only ever opens paths, is unaffected. Other schemes (`http://`, `mailto:`…),
+/// URIs naming another host, and plain paths pass through untouched.
+fn path_from_arg(arg: String) -> String {
+    let Some(rest) = arg.strip_prefix("file://") else { return arg };
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return arg;
+    }
+    // `file:///C:/x.pdf` on Windows names `C:/x.pdf`. `rest` starts with the one-byte '/', so
+    // byte 1 is a char boundary.
+    let rest = if cfg!(windows) && rest.as_bytes().get(2) == Some(&b':') { &rest[1..] } else { rest };
+    let mut out = Vec::with_capacity(rest.len());
+    let mut bytes = rest.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hex = bytes.clone().take(2).collect::<Vec<u8>>();
+            if let Some(byte) = std::str::from_utf8(&hex).ok().filter(|h| h.len() == 2).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                bytes.nth(1);
+                continue;
+            }
+        }
+        out.push(b);
+    }
+    String::from_utf8(out).unwrap_or(arg)
+}
+
 fn main() -> eframe::Result {
+    // First, so the panic hook and every start-up warning are recorded (`logging`).
+    let logger = logging::install();
     // Last-resort guard (AGENTS.md §4): commands, edits, opens and saves catch panics and report
     // them; this hook logs every panic, caught or not, with a backtrace when RUST_BACKTRACE is set.
     std::panic::set_hook(Box::new(|info| {
-        eprintln!("pdfcraft: internal error: {info}");
         let trace = std::backtrace::Backtrace::capture();
-        if trace.status() == std::backtrace::BacktraceStatus::Captured {
-            eprintln!("{trace}");
+        let report = if trace.status() == std::backtrace::BacktraceStatus::Captured {
+            format!("internal error: {info}\n{trace}")
+        } else {
+            format!("internal error: {info}")
+        };
+        // Standard error and the log file; standard error alone when RUST_LOG turned errors off.
+        if log::log_enabled!(log::Level::Error) {
+            log::error!("{report}");
+        } else {
+            // `eprintln!` panics on a broken stderr pipe, and a panic inside the panic hook aborts.
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("pdfcraft: {report}\n"));
         }
     }));
     let mut files = Vec::new();
     let mut options: Vec<(String, String)> = Vec::new();
     let mut control_file: Option<String> = None;
+    let mut create_images = false;
     #[cfg(not(windows))]
     let mut args = std::env::args().skip(1);
     #[cfg(windows)]
@@ -97,20 +157,22 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--control" => control_file = args.next(),
+            "--create-images" => create_images = true,
             flag if flag.starts_with("--") => {
                 let value = args.next().unwrap_or_default();
                 options.push((flag.trim_start_matches("--").to_string(), value));
             }
-            _ => files.push(a),
+            _ => files.push(path_from_arg(a)),
         }
     }
     // Migration must precede IPC setup: creating the new settings directory first would make
     // the rename migration skip old preferences, recent files and recovery data.
     migrate_legacy_folders();
     #[cfg(windows)]
-    let windows_instance = match start_windows_instance(&files) {
-        Ok(Some(instance)) => instance,
-        Ok(None) => return Ok(()),
+    let windows_instance = match start_windows_instance(&files, create_images, settings_dir()) {
+        Ok(WindowsLaunch::Primary(instance)) => Some(instance),
+        Ok(WindowsLaunch::Independent) => None,
+        Ok(WindowsLaunch::Forwarded) => return Ok(()),
         Err(error) => return Err(windows_launch_error(error)),
     };
     #[cfg(windows)]
@@ -126,13 +188,22 @@ fn main() -> eframe::Result {
     // Dock, taskbar, Alt-Tab and launcher icon when running unbundled.
     match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
         Ok(icon) => viewport = viewport.with_icon(icon),
-        Err(e) => eprintln!("pdfcraft: app icon: {e}"),
+        Err(e) => log::warn!("app icon: {e}"),
     }
     if integrated {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
-    // eframe would otherwise derive the settings folder from the app id: keep it under "PdfCraft".
-    let persistence_path = eframe::storage_dir("PdfCraft").map(|d| d.join("app.ron"));
+    // The log file lives in the settings folder; opened after the arguments (so `--version` leaves
+    // no file behind) and after the PrintCraft migration (which a fresh folder would block).
+    // Records logged until now are written to it first.
+    if let (Some(logger), Some(dir)) = (logger, settings_dir()) {
+        match logger.attach_dir(&dir.join("logs")) {
+            Ok(path) => log::info!("PdfCraft {}, log file {}", env!("CARGO_PKG_VERSION"), path.display()),
+            // Standard error only by now (`attach_dir` gave up on the file); unlike `eprintln!`, never panics.
+            Err(e) => log::warn!("no log file: {e}"),
+        }
+    }
+    let persistence_path = settings_dir().map(|d| d.join("app.ron"));
     let mut native = eframe::NativeOptions { viewport, persistence_path, ..Default::default() };
     configure_gpu(&mut native);
     // Finder, Open With and the Dock deliver files as Apple events, not arguments; catch the one
@@ -151,13 +222,13 @@ fn main() -> eframe::Result {
             }
             app.integrated_titlebar = integrated;
             app.update_source = Some(std::sync::Arc::new(updates::latest_release));
-            app.keychain_ids = cfg!(target_os = "macos");
+            app.os_key_store_ids = cfg!(any(target_os = "macos", target_os = "windows"));
             #[cfg(target_os = "macos")]
             {
                 app.os_events = Some(apple_events.connect(&cc.egui_ctx));
             }
             #[cfg(windows)]
-            {
+            if let Some(windows_instance) = windows_instance {
                 let ctx = cc.egui_ctx.clone();
                 let mut poll = windows_instance.connect(move || ctx.request_repaint());
                 let ctx = cc.egui_ctx.clone();
@@ -173,20 +244,37 @@ fn main() -> eframe::Result {
             if let Some(file) = &control_file {
                 let client = app.attach_control(&cc.egui_ctx);
                 match pdfcraft_ui_egui::control::serve(client).and_then(|ep| write_control_file(file, ep.port, &ep.token).map(|()| ep.port)) {
-                    Ok(port) => eprintln!("pdfcraft: UI control channel on 127.0.0.1:{port} (connection details in {file})"),
-                    Err(e) => eprintln!("pdfcraft: --control {file}: {e}"),
+                    // Never the token (AGENTS.md §3): it stays in the owner-only file.
+                    Ok(port) => log::info!("UI control channel on 127.0.0.1:{port} (connection details in {file})"),
+                    Err(e) => log::error!("--control {file}: {e}"),
                 }
             }
             // Autosave unsaved changes; offer to recover documents a crashed session left behind.
             if let Some(dir) = pdfcraft_ui_egui::RecoveryStore::default_dir() {
                 app.enable_recovery(pdfcraft_ui_egui::RecoveryStore::new(dir));
             }
-            for f in files {
-                app.open_path(&f);
+            // A portable marker whose data folder can't be written (#157): say where settings went.
+            if let Some(w) = &pdfcraft_ui_egui::portable::current().unwritable {
+                app.notify_fmt(
+                    "Portable mode is off: {folder} can't be written ({error}). Settings are kept in your user folder instead.",
+                    &[("folder", &w.folder.display().to_string()), ("error", &w.error)],
+                );
+            }
+            if create_images {
+                if let Err(e) = app.begin_image_import_paths(&files) {
+                    app.notify(e);
+                }
+            } else {
+                // With the preference on, last session's files come back first; files named on
+                // the command line open after them, in front (#442).
+                app.reopen_last_files(&files);
+                for f in files {
+                    app.open_path(&f);
+                }
             }
             for (k, v) in options {
                 if let Err(e) = app.set_option(&k, &v) {
-                    eprintln!("pdfcraft: --{k} {v}: {e}");
+                    log::warn!("--{k} {v}: {e}");
                 }
             }
             Ok(Box::new(app))
@@ -206,31 +294,77 @@ fn windows_launch_error(error: std::io::Error) -> eframe::Error {
 }
 
 #[cfg(windows)]
-fn start_windows_instance(files: &[String]) -> std::io::Result<Option<windows_instance::WindowsInstance>> {
-    let profile = eframe::storage_dir("PdfCraft").ok_or_else(|| std::io::Error::other("Windows user profile is unavailable"))?;
+enum WindowsLaunch {
+    Primary(windows_instance::WindowsInstance),
+    Forwarded,
+    Independent,
+}
+
+#[cfg(windows)]
+fn start_windows_instance(files: &[String], create_images: bool, profile: Option<std::path::PathBuf>) -> std::io::Result<WindowsLaunch> {
+    // Image creation is a different workflow, not a request to open PDFs. Preserve upstream's
+    // independent image-import window without registering another document listener.
+    if create_images {
+        return Ok(WindowsLaunch::Independent);
+    }
+    let profile = profile.ok_or_else(|| std::io::Error::other("Windows settings profile is unavailable"))?;
     let paths = open_protocol::absolute_paths(files)?;
     std::fs::create_dir_all(&profile)?;
-    windows_instance::WindowsInstance::start(&windows_instance::endpoint(&profile), &profile.join("document-open.lock"), &paths)
+    // Resolve aliases before hashing so the pipe name and the OS-held lock identify the same
+    // profile. This is also the portable settings directory used for app.ron and recovery.
+    let profile = std::fs::canonicalize(profile)?;
+    match windows_instance::WindowsInstance::start(&windows_instance::endpoint(&profile), &profile.join("document-open.lock"), &paths)? {
+        Some(instance) => Ok(WindowsLaunch::Primary(instance)),
+        None => Ok(WindowsLaunch::Forwarded),
+    }
 }
 
 /// Write the control endpoint so that only the current user can read the token.
+///
+/// The JSON goes to a new file next to `path`, created fresh (owner-only on Unix), which then
+/// replaces `path`. Opening `path` itself would follow a link planted there and truncate whatever
+/// it points at; a rename replaces the link and leaves its target alone. A reader polling for the
+/// file also never sees it half-written.
 fn write_control_file(path: &str, port: u16, token: &str) -> std::io::Result<()> {
+    use std::io::{ErrorKind, Write};
     let json = serde_json::json!({ "port": port, "token": token, "pid": std::process::id() }).to_string();
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    let path = std::path::Path::new(path);
+    let name = path.file_name().ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "not a file name"))?;
+    // Unpredictable suffixes, so the name can't be planted in advance. `RandomState` is keyed from
+    // the operating system's random source.
+    let random = std::hash::RandomState::new();
+    for i in 0..16u32 {
+        let mut staged = std::ffi::OsString::from(".");
+        staged.push(name);
+        staged.push(format!(".{:016x}.tmp", std::hash::BuildHasher::hash_one(&random, i)));
+        let staged = path.with_file_name(staged);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = match opts.open(&staged) {
+            Ok(f) => f,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            // Windows refuses `create_new` on a folder with "access denied"; the name is taken all
+            // the same. A folder we can't write to, with nothing at the name, still fails here.
+            Err(e) if e.kind() == ErrorKind::PermissionDenied && staged.symlink_metadata().is_ok() => continue,
+            Err(e) => return Err(e),
+        };
+        // The block closes the file before it is renamed.
+        let written = {
+            let mut file = file;
+            file.write_all(json.as_bytes())
+        };
+        let done = written.and_then(|()| std::fs::rename(&staged, path));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        return done;
     }
-    use std::io::Write;
-    let mut f = opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(json.as_bytes())
+    Err(std::io::Error::new(ErrorKind::AlreadyExists, "no free name for the control file's temporary copy"))
 }
 
 /// How wgpu finds a GPU. Each choice yields to its wgpu environment variable.
@@ -329,6 +463,67 @@ fn pick_adapter(adapters: &[(u32, u32, eframe::wgpu::DeviceType)], displays: &[(
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_startup_separates_portable_profiles_and_normalizes_forwarded_paths() {
+        use super::{WindowsLaunch, start_windows_instance};
+        let root = std::env::temp_dir().join(format!("pdfcraft-startup-profiles-{}", std::process::id()));
+        let exe = root.join("portable-app");
+        std::fs::create_dir_all(&exe).unwrap();
+        std::fs::write(exe.join("portable.txt"), b"").unwrap();
+        let portable = pdfcraft_ui_egui::portable::resolve(Some(&exe)).dir.unwrap();
+        let installed = root.join("user-profile");
+        let WindowsLaunch::Primary(portable_owner) = start_windows_instance(&[], false, Some(portable.clone())).unwrap() else {
+            panic!("first portable launch must own its profile")
+        };
+        let WindowsLaunch::Primary(installed_owner) = start_windows_instance(&[], false, Some(installed.clone())).unwrap() else {
+            panic!("different profile must remain independent")
+        };
+        let mut portable_poll = portable_owner.connect(|| {});
+        let mut installed_poll = installed_owner.connect(|| {});
+        let document = root.join("two words 日本語.pdf");
+        let uri = format!("file:///{}", document.to_string_lossy().replace('\\', "/").replace(' ', "%20"));
+        let paths = vec![super::path_from_arg(uri), "relative document.pdf".into()];
+        let expected = super::open_protocol::absolute_paths(&paths).unwrap();
+        assert!(matches!(start_windows_instance(&paths, false, Some(portable.join("."))).unwrap(), WindowsLaunch::Forwarded));
+        assert_eq!(portable_poll(), vec![expected]);
+        assert!(installed_poll().is_empty());
+        assert!(matches!(start_windows_instance(&paths, false, Some(installed)).unwrap(), WindowsLaunch::Forwarded));
+        assert_eq!(installed_poll().len(), 1);
+        assert!(portable_poll().is_empty());
+        drop(portable_owner);
+        drop(installed_owner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_startup_image_import_neither_claims_nor_forwards() {
+        use super::{WindowsLaunch, start_windows_instance};
+        let root = std::env::temp_dir().join(format!("pdfcraft-startup-images-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let images = vec!["scan.png".into(), "second scan.jpg".into()];
+        assert!(matches!(start_windows_instance(&images, true, None).unwrap(), WindowsLaunch::Independent));
+        assert!(matches!(start_windows_instance(&images, true, Some(root.clone())).unwrap(), WindowsLaunch::Independent));
+        assert!(!root.exists(), "image-only launch must not create an IPC profile");
+        let WindowsLaunch::Primary(owner) = start_windows_instance(&[], false, Some(root.clone())).unwrap() else {
+            panic!("image launch must not own the document endpoint")
+        };
+        let mut poll = owner.connect(|| {});
+        assert!(matches!(start_windows_instance(&images, true, Some(root.clone())).unwrap(), WindowsLaunch::Independent));
+        assert!(poll().is_empty(), "images must not be delivered as PDF opens");
+        assert!(matches!(start_windows_instance(&[], false, Some(root.clone())).unwrap(), WindowsLaunch::Forwarded));
+        assert_eq!(poll(), vec![Vec::<String>::new()], "ordinary empty launch still requests activation");
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_startup_without_a_profile_reports_an_error() {
+        assert!(super::start_windows_instance(&[], false, None).is_err());
+    }
     #[test]
     fn rename_migration_preserves_preferences_and_does_not_replace_new_settings() {
         let root = std::env::temp_dir().join(format!("pdfcraft-migration-{}", std::process::id()));
@@ -346,6 +541,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(new.join("app.ron")).unwrap(), "legacy preferences");
         assert!(old.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_from_arg_decodes_file_uris() {
+        assert_eq!(super::path_from_arg("file:///home/alice/report.pdf".to_string()), "/home/alice/report.pdf");
+        assert_eq!(super::path_from_arg("file:///home/alice/my%20report.pdf".to_string()), "/home/alice/my report.pdf");
+        assert_eq!(super::path_from_arg("file://localhost/tmp/a%C3%A9.pdf".to_string()), "/tmp/aé.pdf");
+        // Malformed or truncated escapes are kept as written; bytes that aren't UTF-8 keep the URI.
+        assert_eq!(super::path_from_arg("file:///tmp/100%.pdf".to_string()), "/tmp/100%.pdf");
+        assert_eq!(super::path_from_arg("file:///tmp/a%2".to_string()), "/tmp/a%2");
+        assert_eq!(super::path_from_arg("file:///tmp/%zz%".to_string()), "/tmp/%zz%");
+        assert_eq!(super::path_from_arg("file:///tmp/%FF.pdf".to_string()), "file:///tmp/%FF.pdf");
+    }
+
+    #[test]
+    fn path_from_arg_leaves_plain_paths_and_other_schemes_alone() {
+        assert_eq!(super::path_from_arg("report.pdf".to_string()), "report.pdf");
+        assert_eq!(super::path_from_arg("/home/alice/report.pdf".to_string()), "/home/alice/report.pdf");
+        assert_eq!(super::path_from_arg("https://example.com/report.pdf".to_string()), "https://example.com/report.pdf");
+        assert_eq!(super::path_from_arg("file://server/share/a.pdf".to_string()), "file://server/share/a.pdf");
+        assert_eq!(super::path_from_arg("file://".to_string()), "file://");
     }
 
     #[test]
@@ -416,5 +632,77 @@ mod tests {
         assert_eq!(gpus, vec![NVIDIA]);
         assert!(super::linux_display_gpus(std::path::Path::new("/nonexistent/drm")).is_empty());
         Ok(())
+    }
+
+    /// A fresh folder per call: tests run in parallel.
+    fn scratch() -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("pdfcraft-control-file-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The control file's port and token, and every name in its folder.
+    fn written(dir: &std::path::Path) -> (serde_json::Value, Vec<String>) {
+        let json = serde_json::from_str(&std::fs::read_to_string(dir.join("ctl.json")).unwrap()).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        (json, names)
+    }
+
+    #[test]
+    fn the_control_file_replaces_a_hard_link_instead_of_writing_through_it() {
+        // The file used to be opened with create + truncate, so a link planted at the path had its
+        // target truncated and overwritten with the token.
+        let dir = scratch();
+        std::fs::write(dir.join("victim.txt"), "keep me").unwrap();
+        std::fs::hard_link(dir.join("victim.txt"), dir.join("ctl.json")).unwrap();
+        super::write_control_file(&dir.join("ctl.json").to_string_lossy(), 4242, "t0ken").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("victim.txt")).unwrap(), "keep me");
+        let (json, names) = written(&dir);
+        assert_eq!((json["port"].as_u64(), json["token"].as_str()), (Some(4242), Some("t0ken")));
+        assert_eq!(names, ["ctl.json", "victim.txt"], "no temporary file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_control_file_replaces_a_symlink_instead_of_writing_through_it() {
+        let dir = scratch();
+        let (link, target) = (dir.join("ctl.json"), dir.join("victim.txt"));
+        std::fs::write(&target, "keep me").unwrap();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&target, &link);
+        if let Err(e) = made {
+            // Windows needs Developer Mode (or admin) for symlinks.
+            eprintln!("skipped: can't create a symlink here: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        super::write_control_file(&link.to_string_lossy(), 4242, "t0ken").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(written(&dir).0["token"].as_str(), Some("t0ken"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_control_file_replaces_the_one_a_previous_run_left() {
+        let dir = scratch();
+        std::fs::write(dir.join("ctl.json"), r#"{"port":1,"token":"old"}"#).unwrap();
+        super::write_control_file(&dir.join("ctl.json").to_string_lossy(), 4242, "t0ken").unwrap();
+        let (json, names) = written(&dir);
+        assert_eq!(json["token"].as_str(), Some("t0ken"));
+        assert_eq!(names, ["ctl.json"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("ctl.json")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "only the owner can read the token: {mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -43,6 +43,7 @@ fn harness_pages(pages: usize) -> (Harness<'static, PdfCraftApp>, ControlClient)
     let s = slot.clone();
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |cc| {
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         *s.lock().unwrap() = Some(app.attach_control(&cc.egui_ctx));
         app.open_bytes("doc.pdf", None, fixture(pages)).unwrap();
         app
@@ -68,6 +69,58 @@ fn ok(h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, method: &str, pa
     call(h, c, method, params).unwrap_or_else(|e| panic!("{method}: {e}"))
 }
 
+#[test]
+fn bookmark_titles_can_be_searched_over_control() {
+    let (mut h, c) = harness();
+    for (index, title, page) in [(0, "Background", 0), (1, "Target chapter", 3)] {
+        h.state_mut().apply_edit(pdfcraft_engine::Edit::AddBookmark { parent: vec![], index, title: title.into(), page });
+    }
+    ok(&mut h, &c, "ui.set", json!({ "key": "panel", "value": "bookmarks" }));
+    h.run_steps(3);
+    let widgets = ok(&mut h, &c, "ui.inspect", json!({ "query": "Search", "role": "TextInput" }));
+    let rect = &widgets["widgets"][0]["rect"];
+    let x = (rect[0].as_f64().unwrap() + rect[2].as_f64().unwrap()) / 2.0;
+    let y = (rect[1].as_f64().unwrap() + rect[3].as_f64().unwrap()) / 2.0;
+    ok(&mut h, &c, "ui.click", json!({ "x": x, "y": y }));
+    ok(&mut h, &c, "ui.type", json!({ "text": "target" }));
+    h.get_by_label("Target chapter");
+    assert!(h.query_by_label("Background").is_none());
+    ok(&mut h, &c, "ui.click", json!({ "label": "Target chapter" }));
+    assert_eq!(h.state().views[0].current, 3);
+    if let Ok(dir) = std::env::var("PDFCRAFT_BOOKMARK_SHOTS") {
+        h.render().unwrap().save(format!("{dir}/control-filtered-bookmarks.png")).unwrap();
+    }
+    ok(&mut h, &c, "ui.click", json!({ "label": "Clear" }));
+    h.get_by_label("Background");
+    h.get_by_label("Target chapter");
+    if let Ok(dir) = std::env::var("PDFCRAFT_BOOKMARK_SHOTS") {
+        h.render().unwrap().save(format!("{dir}/control-cleared-bookmarks.png")).unwrap();
+    }
+}
+
+#[test]
+fn theme_commands_and_options_report_preference_and_effective_colours() {
+    let (mut h, c) = harness();
+    h.input_mut().system_theme = Some(egui::Theme::Dark);
+    h.run_steps(2);
+    for (id, preference, effective) in
+        [("view.theme.system", "System", "Dark"), ("view.theme.light", "Light", "Light"), ("view.theme.dark", "Dark", "Dark")]
+    {
+        ok(&mut h, &c, "ui.command", json!({ "id": id }));
+        let state = ok(&mut h, &c, "ui.state", json!({}));
+        assert_eq!(state["theme_preference"], preference);
+        assert_eq!(state["theme"], effective);
+    }
+    ok(&mut h, &c, "ui.set", json!({ "key": "theme", "value": "system" }));
+    h.input_mut().system_theme = Some(egui::Theme::Light);
+    h.run_steps(2);
+    let state = ok(&mut h, &c, "ui.state", json!({}));
+    assert_eq!(state["theme_preference"], "System");
+    assert_eq!(state["theme"], "Light");
+    assert!(call(&mut h, &c, "ui.set", json!({ "key": "theme", "value": "purple" })).is_err());
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["theme_preference"], "System");
+}
+
 /// Switching the interface language changes labels only: documents, their dirty state and the
 /// command ids agents drive stay exactly the same.
 #[test]
@@ -79,7 +132,7 @@ fn language_switch_preserves_document_and_command_ids() {
     let documents = ok(&mut h, &c, "ui.state", json!({}))["documents"].clone();
     assert_eq!(documents[0]["dirty"], true);
     let commands = ok(&mut h, &c, "ui.commands", json!({}));
-    for code in ["ja", "zh-hans", "en"] {
+    for code in ["ja", "zh-hans", "fr", "de", "en"] {
         ok(&mut h, &c, "ui.set", json!({ "key": "language", "value": code }));
         h.run_steps(2);
         let state = ok(&mut h, &c, "ui.state", json!({}));
@@ -524,6 +577,61 @@ fn japanese_dialogs_errors_and_custom_action_names() {
 }
 
 #[test]
+fn simplified_chinese_about_tabs_and_credit_controls() {
+    let (mut h, c) = harness();
+    let documents = ok(&mut h, &c, "ui.state", json!({}))["documents"].clone();
+    ok(&mut h, &c, "ui.set", json!({"key": "language", "value": "zh-hans"}));
+    ok(&mut h, &c, "ui.set", json!({"key": "dialog", "value": "about"}));
+    for label in ["关于", "贡献者", "模型"] {
+        let found = ok(&mut h, &c, "ui.inspect", json!({"query": label}));
+        assert!(found["widgets"].as_array().unwrap().iter().any(|w| w["label"] == label), "{found}");
+    }
+    ok(&mut h, &c, "ui.click", json!({"label": "贡献者"}));
+    for label in ["用户名", "显示名称", "真实姓名", "排序", "名称列表", "表格", "首次提交"] {
+        let found = ok(&mut h, &c, "ui.inspect", json!({"query": label}));
+        assert!(found["count"].as_u64().unwrap() > 0, "{label}: {found}");
+    }
+    ok(&mut h, &c, "ui.click", json!({"label": "表格"}));
+    for label in ["新增行", "删除行", "净增行", "新增资源", "删除资源"] {
+        let found = ok(&mut h, &c, "ui.inspect", json!({"query": label}));
+        assert!(found["count"].as_u64().unwrap() > 0, "{label}: {found}");
+    }
+    ok(&mut h, &c, "ui.click", json!({"label": "模型"}));
+    let columns = ok(&mut h, &c, "ui.inspect", json!({"query": "占全部提交的比例"}));
+    let empty = ok(&mut h, &c, "ui.inspect", json!({"query": "此版本未包含模型贡献记录。"}));
+    assert!(columns["count"].as_u64().unwrap() > 0 || empty["count"].as_u64().unwrap() > 0, "{columns}, {empty}");
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["documents"], documents);
+}
+
+#[test]
+fn simplified_chinese_signature_prompts_and_errors_keep_document_state() {
+    let (mut h, c) = harness();
+    let documents = ok(&mut h, &c, "ui.state", json!({}))["documents"].clone();
+    ok(&mut h, &c, "ui.set", json!({"key": "language", "value": "zh-hans"}));
+    ok(&mut h, &c, "ui.set", json!({"key": "dialog", "value": "signature"}));
+    let typed = ok(&mut h, &c, "ui.inspect", json!({"query": "请输入您的签名。"}));
+    assert!(typed["count"].as_u64().unwrap() > 0, "{typed}");
+    // The shell also has a Draw control; the modal's button is registered after the shell.
+    let draw = ok(&mut h, &c, "ui.inspect", json!({"query": "绘制"}));
+    let id = draw["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|w| w["label"] == "绘制" && w["clickable"] == true)
+        .expect("signature Draw button")["id"]
+        .clone();
+    ok(&mut h, &c, "ui.click", json!({"id": id}));
+    let drawn = ok(&mut h, &c, "ui.inspect", json!({"query": "请在下方绘制您的签名。"}));
+    assert!(drawn["count"].as_u64().unwrap() > 0, "{drawn}");
+    ok(&mut h, &c, "ui.click", json!({"label": "取消"}));
+    assert!(!h.state_mut().apply_edit(pdfcraft_engine::Edit::DeletePages { pages: vec![0, 1, 2, 3, 4] }));
+    let state = ok(&mut h, &c, "ui.state", json!({}));
+    assert_eq!(state["notice"], "删除页面失败：a document must keep at least one page");
+    assert_eq!(state["documents"], documents, "a language change and failed edit must preserve the document");
+}
+
+#[test]
 fn inspect_and_click_by_label_and_id() {
     let (mut h, c) = harness();
     let found = ok(&mut h, &c, "ui.inspect", json!({ "query": "read" }));
@@ -547,6 +655,20 @@ fn inspect_and_click_by_label_and_id() {
     let err = call(&mut h, &c, "ui.click", json!({ "label": "No such button" })).unwrap_err();
     assert!(err.contains("no enabled clickable widget"), "{err}");
     assert!(call(&mut h, &c, "ui.click", json!({ "id": 12345 })).is_err());
+}
+
+#[test]
+fn cover_page_command_needs_two_page_view() {
+    // Agents see the cover toggle as disabled, and get an error, until two-page view.
+    let (mut h, c) = harness();
+    let enabled = |list: Value| list["commands"].as_array().unwrap().iter().find(|x| x["id"] == "view.layout.cover").unwrap()["enabled"].clone();
+    assert_eq!(enabled(ok(&mut h, &c, "ui.commands", json!({}))), false);
+    let err = call(&mut h, &c, "ui.command", json!({ "id": "view.layout.cover" })).unwrap_err();
+    assert!(err.contains("disabled"), "{err}");
+    ok(&mut h, &c, "ui.command", json!({ "id": "view.layout.two_up" }));
+    assert_eq!(enabled(ok(&mut h, &c, "ui.commands", json!({}))), true);
+    ok(&mut h, &c, "ui.command", json!({ "id": "view.layout.cover" }));
+    assert!(h.state().views[0].cover);
 }
 
 #[test]
@@ -585,6 +707,14 @@ fn select_all_key_selects_every_page_in_organize() {
     assert_eq!(h.state().views[0].target_pages(), [0, 1, 2, 3, 4]);
     assert_eq!(h.state().views[0].current, 2);
     assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["documents"][0]["dirty"], false);
+}
+
+#[test]
+fn state_reports_the_selected_pages() {
+    let (mut h, c) = harness();
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["active"]["selected_pages"], json!([]));
+    ok(&mut h, &c, "ui.set", json!({ "key": "select", "value": "2,4" }));
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["active"]["selected_pages"], json!([2, 4]));
 }
 
 #[test]
@@ -716,4 +846,60 @@ fn control_default_workspace_and_session_override() {
     ok(&mut h, &c, "ui.set", json!({"key": "mode", "value": "read"}));
     h.state_mut().open_bytes("another.pdf", None, fixture(1)).unwrap();
     assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["mode"], "Read");
+}
+
+#[test]
+fn measurement_tools_draw_live_calibrate_save_and_export() {
+    let (mut h, c) = harness_pages(1);
+    let doc = h.state().views[0].id;
+    h.state_mut().set_option("zoom", "100").unwrap();
+    ok(&mut h, &c, "ui.command", json!({"id":"measure.scale"}));
+    h.run_steps(3);
+    h.state_mut().views[0].measure.drawing_points = 10.0;
+    h.state_mut().views[0].measure.real_distance = 1.0;
+    h.state_mut().views[0].measure.unit = "m".into();
+    h.get_by_label("Apply scale").click();
+    h.run_steps(3);
+    let scale = h.state().session.get(doc).unwrap().measurement_scale(0, [20.0, 20.0]).unwrap();
+    assert!((scale.x - 0.1).abs() < 1e-10);
+    let click = |h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, x: f32, y: f32| {
+        let r = h.state().views[0].page_screen_rect(0).unwrap();
+        ok(h, c, "ui.click", json!({"x":r.left()+x*r.width()/200.0,"y":r.top()+y*r.height()/300.0}));
+        h.run_steps(2);
+    };
+    for (command, points) in [
+        ("measure.distance", vec![(20.0, 30.0), (80.0, 110.0)]),
+        ("measure.perimeter", vec![(20.0, 130.0), (80.0, 130.0), (80.0, 210.0)]),
+        ("measure.area", vec![(100.0, 130.0), (160.0, 130.0), (160.0, 210.0), (100.0, 210.0)]),
+    ] {
+        ok(&mut h, &c, "ui.command", json!({"id":command}));
+        for (x, y) in points {
+            click(&mut h, &c, x, y);
+        }
+        if command != "measure.distance" {
+            ok(&mut h, &c, "ui.key", json!({"key":"Enter"}));
+            h.run_steps(3);
+        }
+    }
+    let measurements = h.state().session.get(doc).unwrap().measurements().unwrap().measurements;
+    assert_eq!(measurements.len(), 3);
+    for (m, value) in measurements.iter().zip([10.0, 14.0, 48.0]) {
+        assert!((m.reading.value - value).abs() < 0.01, "{m:?}");
+    }
+    ok(&mut h, &c, "ui.command", json!({"id":"edit.undo"}));
+    h.run_steps(2);
+    assert_eq!(h.state().session.get(doc).unwrap().measurements().unwrap().measurements.len(), 2);
+    ok(&mut h, &c, "ui.command", json!({"id":"edit.redo"}));
+    h.run_steps(2);
+    let dir = std::env::temp_dir().join(format!("pdfcraft-measure-ui-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    h.state_mut().export_dir_override = Some(dir.to_string_lossy().into());
+    ok(&mut h, &c, "ui.command", json!({"id":"measure.export"}));
+    h.run_steps(2);
+    assert!(std::fs::read_to_string(dir.join("measurements.csv")).unwrap().contains("m^2"));
+    h.state_mut().set_option("quick", "measure-calibrate").unwrap();
+    click(&mut h, &c, 30.0, 50.0);
+    click(&mut h, &c, 130.0, 50.0);
+    assert!((h.state().views[0].measure.drawing_points - 100.0).abs() < 0.01);
+    let _ = std::fs::remove_dir_all(dir);
 }
