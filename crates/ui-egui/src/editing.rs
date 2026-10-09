@@ -52,6 +52,14 @@ impl PdfCraftApp {
                     }
                     Edit::InsertBlankPage { at, .. } => view.select_pages(&[at.min(info.pages.len() - 1)]),
                     Edit::DeletePages { .. } => view.select_pages(&[]),
+                    // A stroke drawn with the pen stays unselected, so the selection box and
+                    // author popup don't sit over the next stroke (#429).
+                    Edit::AddAnnotation(a)
+                        if matches!(a.shape, pdfcraft_engine::Shape::Ink { .. })
+                            && self.quick_tool == crate::QuickTool::Comment(crate::comments::CommentTool::Ink) =>
+                    {
+                        view.comments.selected = None;
+                    }
                     Edit::AddAnnotation(a) => {
                         // Select the new comment (appended last among the page's comments).
                         let newest = info.annotations.iter().filter(|x| x.page == a.page && x.in_reply_to.is_none()).map(|x| x.index).max();
@@ -259,6 +267,21 @@ impl PdfCraftApp {
     /// brought forward first, so the commit and any field scripts act on that document.
     pub(crate) fn commit_typing_in(&mut self, id: pdfcraft_engine::DocId) -> bool {
         let Some(i) = self.views.iter().position(|v| v.id == id) else { return true };
+        // Added text the standard fonts can't draw can't be saved: show it rather than drop it.
+        // Its page is brought into view, so the text, the warning and Discard are on screen.
+        let blocked = self.views.get_mut(i).and_then(|v| {
+            let c = v.content.blocked()?;
+            v.content.hold_blocked();
+            if let Some(page) = v.content.draft.as_ref().map(|d| d.page) {
+                v.go_to_page(page);
+            }
+            Some(c)
+        });
+        if let Some(c) = blocked {
+            self.active = Some(i);
+            self.notify(crate::content_ui::undrawable_message(c));
+            return false;
+        }
         if self.active != Some(i) {
             let typing = self.views.get(i).is_some_and(|v| v.pending_edit.is_some() || v.forms.focus.is_some());
             if !typing {
@@ -273,7 +296,10 @@ impl PdfCraftApp {
     pub(crate) fn has_unsaved_work(&self, index: usize) -> bool {
         let Some(v) = self.views.get(index) else { return false };
         let Some(doc) = self.session.get(v.id) else { return false };
-        doc.dirty || v.pending_edit.is_some() || v.forms.focus.as_ref().is_some_and(|f| crate::forms_ui::draft_edit(f, &doc.form).is_some())
+        doc.dirty
+            || v.pending_edit.is_some()
+            || v.content.blocked().is_some()
+            || v.forms.focus.as_ref().is_some_and(|f| crate::forms_ui::draft_edit(f, &doc.form).is_some())
     }
 
     /// Save the active document. Returns `true` if it was written.

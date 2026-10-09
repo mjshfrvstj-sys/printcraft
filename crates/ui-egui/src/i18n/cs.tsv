@@ -10,6 +10,7 @@
 
 	Menu	Nabídka
 	File	Soubor
+	Rotation:	Otočení:
 	Edit	Úpravy
 	Pages	Stránky
 	View	Zobrazení
@@ -29,6 +30,10 @@
 	OK	OK
 	Open…	Otevřít…
 	Open Recent	Otevřít nedávné soubory
+	Clear Recent Files	Vymazat nedávné soubory
+	Remove from Recent	Odebrat z nedávných souborů
+	Remove {name} from Recent	Odebrat {name} z nedávných souborů
+	Clear	Vymazat
 	Pin folder to Home…	Připnout složku na úvodní stránku…
 	No recent files	Žádné nedávné soubory
 	New blank PDF	Nový prázdný dokument PDF

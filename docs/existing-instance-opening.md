@@ -62,6 +62,36 @@ The tested snapshot `ffb1f49` is preserved locally as
 - Upstream image-import staging, logging, secure control endpoint publication and
   picker-worker synchronization. No new image-import forwarding is introduced.
 
+### Renderer fallback lifecycle
+
+Upstream `f1af1e2` includes #530 (`36af4af`), which can retry a failed wgpu
+initialization with OpenGL. Instance election happens exactly once in `main`,
+after profile resolution/migration and before either renderer attempt. The same
+launch-owned guard is borrowed by each app creator; neither the creator nor the
+renderer runner owns or recreates the listener.
+
+If wgpu fails before invoking its app creator, dropping that unused creator leaves
+the pipe, OS lock and bounded inbox alive. Secondary processes continue forwarding
+to the original owner throughout the transition. Only the successfully invoked
+creator attaches the OS-event poller. The normal first frame drains pending batches
+after settings/session/initial-file/option initialization. A drained batch is not
+replayed during later frames. Once app creation has begun, upstream's fallback
+policy prohibits a retry, avoiding a second document/session initialization.
+
+Both renderers failing (or another terminal startup error) returns from `main`,
+which drops the guard, joins bounded client work and releases the pipe and lock.
+Acknowledged batches are still only in memory: terminal startup failure, process
+failure or shutdown before delivery can lose them. This is not durable or global
+exactly-once delivery. The regression asserts single consumption of acknowledged
+batches during a successful fallback within one surviving launch.
+
+Tests inject renderer results rather than inducing GPU failures. Portable tests
+exercise retry eligibility and successful first initialization. Native Windows
+tests discard the first app creator, forward multiple concurrent batches before
+and during fallback, attach the real OS-event adapter, check single consumption,
+and verify ownership is released after both attempts fail. Existing profile,
+image-import, restoration and pipe race/crash/deadline tests remain unchanged.
+
 ## Relationship to PR #518
 
 [PR #518](https://github.com/storytold/pdfcraft/pull/518), reviewed at
@@ -249,6 +279,22 @@ restored-session tabs followed by incoming documents. The original pipe and
 PR #172 regressions remain in place. Local integration checks passed: 1,338 tests passed, zero failed, five ignored;
 formatting, all-target Clippy, WASM (30 crates), layering (34 crates), assets,
 parity and dependency checks passed. Parity reports 95 existing missing-tool
-notices. Native CI revalidation is pending for this merge.
+notices. Native CI at `d29fb8e` subsequently passed; see the results below.
 The existing CI workflow has a default-off `test_macos` dispatch input so all three
 platforms can be tested explicitly without consuming macOS slots on routine runs.
+
+### Renderer-integration validation
+
+The passing run [37943646798](https://github.com/mjshfrvstj-sys/printcraft/actions/runs/37943646798)
+validated **pre-renderer-integration** commit `d29fb8e`: Windows 1,357 passed/5
+ignored; Linux 1,353/4; macOS 1,338/5; zero failures. WASM and dependency checks
+passed; fuzzing completed 198,371 executions with no crashes or hangs. Those
+results do not validate this later renderer-lifecycle integration. Fresh local validation passed: 1,411 tests passed, zero failed, five ignored;
+formatting, all-target Clippy, WASM (30 crates), layering (34 crates), assets,
+parity, dependencies and CLI without default features passed. Native CI validation
+for the renderer integration is pending.
+
+The integrated upstream #516 added a forms→render dev-dependency that the layering
+checker rejected. Its rendering regression is relocated unchanged to an engine
+integration test, with its synthetic fixture and parity evidence retained. The
+forms crate no longer depends sideways on render; the layering policy is unchanged.
