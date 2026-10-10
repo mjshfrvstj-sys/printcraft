@@ -78,7 +78,8 @@ after settings/session/initial-file/option initialization. A drained batch is no
 replayed during later frames. Once app creation has begun, upstream's fallback
 policy prohibits a retry, avoiding a second document/session initialization.
 
-Both renderers failing (or another terminal startup error) returns from `main`,
+Both renderers failing (or another terminal startup error, including inability to
+publish an explicitly requested `--control` endpoint) returns from `main`,
 which drops the guard, joins bounded client work and releases the pipe and lock.
 Acknowledged batches are still only in memory: terminal startup failure, process
 failure or shutdown before delivery can lose them. This is not durable or global
@@ -310,3 +311,9 @@ no layering exception is needed. Startup incorporates upstream GPU surface-limit
 handling while retaining the existing launch-owned Windows listener and retry tests.
 Validation for this integrated commit is recorded in PR #616; earlier CI results
 above are historical and do not substitute for the new run.
+
+The subsequent integration through upstream `a99b393` retains the GPU selection,
+surface-configuration error handling and control-channel startup checks. Conflict
+resolution combines the Windows dependencies and both sets of startup helpers and
+tests; the pipe transport and framing protocol are unchanged. Renderer attempts
+still borrow the one launch-owned listener. Fresh validation is tracked in PR #616.
