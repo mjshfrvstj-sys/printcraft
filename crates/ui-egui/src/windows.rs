@@ -572,7 +572,7 @@ impl PdfCraftApp {
             match op {
                 WindowOp::Focus(id) => self.focus_window(id),
                 WindowOp::NewView { doc, from } => self.new_view_window(doc, from),
-                WindowOp::MoveTab { doc, from, to } => self.move_tab(doc, from, to),
+                WindowOp::MoveTab { doc, from, to } => self.transfer_tab(doc, from, to),
                 WindowOp::Close(id) => self.close_window(id),
                 WindowOp::MergeAll => self.merge_all_windows(),
                 WindowOp::Promote(id) => self.promote_window(id),
@@ -713,13 +713,20 @@ impl PdfCraftApp {
         .flatten()
     }
 
-    fn move_tab(&mut self, doc: DocId, from: WindowId, to: Option<WindowId>) {
+    /// Transfer an existing view between windows; `move_tab` remains the tab-reordering API.
+    fn transfer_tab(&mut self, doc: DocId, from: WindowId, to: Option<WindowId>) {
         if to == Some(from) {
             return;
         }
         if let Some(target) = to
             && !self.has_window(target)
         {
+            return;
+        }
+        // Refuse before taking the view: repairing an orphaned document would recreate a
+        // default view and lose its search, navigation, drafts and render-client state.
+        if to.is_none() && self.windows.len() >= MAX_WINDOWS.saturating_sub(1) {
+            self.notify_tr("Too many windows are open");
             return;
         }
         let Some(view) = self.take_view(doc, from) else { return };

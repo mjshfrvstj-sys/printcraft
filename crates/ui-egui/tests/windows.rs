@@ -194,6 +194,276 @@ fn move_tab_new_moves() {
     assert!(!h.state_mut().execute("window.move_tab_new"));
 }
 
+/// Fill the desktop's window slots with parked views of `doc`. This uses the test hook because
+/// the purpose is to exercise a transfer at the exact boundary, without opening dozens of native
+/// windows.
+fn fill_window_slots(h: &mut Harness<'static, PdfCraftApp>, doc: pdfcraft_engine::DocId) {
+    while h.state().window_count() < pdfcraft_ui_egui::windows::MAX_WINDOWS {
+        assert!(h.state_mut().test_add_parked_view(doc).is_some());
+    }
+}
+
+/// A view-local snapshot that should survive a rejected transfer unchanged.
+#[derive(Debug, PartialEq)]
+struct ViewSnapshot {
+    number: u32,
+    zoom: f32,
+    page: usize,
+    pending_goto: Option<(usize, f32)>,
+    pending_scroll: f32,
+    find_query: String,
+    find_pages: Vec<usize>,
+    paragraph_draft: Option<String>,
+}
+
+fn transfer_view_state(app: &mut PdfCraftApp, window: WindowId, index: usize) -> ViewSnapshot {
+    app.with_window(window, |a| {
+        let view = &a.views[index];
+        ViewSnapshot {
+            number: view.view_no,
+            zoom: view.zoom,
+            page: view.current,
+            pending_goto: view.goto,
+            pending_scroll: view.key_scroll,
+            find_query: view.find.as_ref().map(|find| find.query.clone()).unwrap_or_default(),
+            find_pages: view.find_match_pages(),
+            paragraph_draft: view.line_editor.as_ref().map(|editor| editor.text.clone()),
+        }
+    })
+    .unwrap()
+}
+
+fn configure_transfer_view(app: &mut PdfCraftApp, window: WindowId, index: usize) {
+    app.with_window(window, |a| {
+        let view = &mut a.views[index];
+        view.set_zoom(1.75);
+        view.go_to_page(0);
+        view.goto = Some((0, 0.42));
+        view.key_scroll = 37.0;
+        view.open_find();
+        if let Some(find) = view.find.as_mut() {
+            find.query = "retained search".into();
+        }
+        view.rerun_find();
+        view.test_deliver_text(0, "retained search");
+        assert_eq!(view.find_match_pages(), vec![0]);
+        view.test_open_line_editor(0, 0, "unfinished paragraph draft");
+    });
+}
+
+#[derive(Debug, PartialEq)]
+struct TransferSnapshot {
+    view: ViewSnapshot,
+    edit_generation: u64,
+    undo: Option<String>,
+    dirty: bool,
+    view_count: usize,
+    source_active: Option<usize>,
+    window_ids: Vec<WindowId>,
+    document_ids: Vec<pdfcraft_engine::DocId>,
+    loaded_window: WindowId,
+    recovery_entries: Vec<pdfcraft_ui_egui::RecoveryMeta>,
+}
+
+fn transfer_snapshot(app: &mut PdfCraftApp, window: WindowId, index: usize, doc: pdfcraft_engine::DocId) -> TransferSnapshot {
+    let (edit_generation, undo, dirty) = {
+        let document = app.session.get(doc).unwrap();
+        (document.edit_generation(), document.can_undo().map(str::to_owned), document.dirty)
+    };
+    TransferSnapshot {
+        view: transfer_view_state(app, window, index),
+        edit_generation,
+        undo,
+        dirty,
+        view_count: app.view_count(doc),
+        source_active: app.with_window(window, |a| a.active).unwrap(),
+        window_ids: app.window_ids(),
+        document_ids: app.session.docs().iter().map(|document| document.id).collect(),
+        loaded_window: app.current_window(),
+        recovery_entries: app.recovery.as_ref().map(|store| store.list()).unwrap_or_default(),
+    }
+}
+
+fn enable_test_recovery(app: &mut PdfCraftApp, name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pdfcraft-transfer-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    app.enable_recovery(pdfcraft_ui_egui::RecoveryStore::new(&dir));
+    app.autosave_now();
+    assert!(!app.recovery.as_ref().unwrap().list().is_empty(), "the dirty document has a recovery snapshot");
+    dir
+}
+
+fn assert_full_window_refusal_keeps_document_and_view(
+    app: &mut PdfCraftApp,
+    window: WindowId,
+    index: usize,
+    doc: pdfcraft_engine::DocId,
+    expected: &TransferSnapshot,
+) {
+    let actual = transfer_snapshot(app, window, index, doc);
+    assert_eq!(&actual, expected, "a rejected transfer leaves the source tab and shared document untouched");
+    assert!(app.session.get(doc).unwrap().dirty);
+    assert!(app.view_count(doc) > 0);
+    assert!(app.session.get(doc).is_some());
+    assert_windows_ok(app);
+
+    // Exercise the shared history after the rejected move as well: both sides of the stack must
+    // still be usable, and the dirty document must remain open.
+    app.session.undo(doc).unwrap();
+    assert!(app.session.get(doc).unwrap().can_redo().is_some());
+    app.session.redo(doc).unwrap();
+    assert!(app.session.get(doc).unwrap().dirty);
+}
+
+#[test]
+fn move_tab_new_at_window_limit_keeps_root_source_and_its_work() {
+    let mut h = two_docs_harness();
+    let doc = h.state().views[1].id;
+    rotate_in(&mut h, WindowId::ROOT);
+    configure_transfer_view(h.state_mut(), WindowId::ROOT, 1);
+    fill_window_slots(&mut h, doc);
+    assert_eq!(h.state().window_count(), pdfcraft_ui_egui::windows::MAX_WINDOWS);
+    let recovery_dir = enable_test_recovery(h.state_mut(), "root");
+    let views_before = h.state().view_count(doc);
+    h.state_mut().active = Some(1);
+    let expected = transfer_snapshot(h.state_mut(), WindowId::ROOT, 1, doc);
+
+    assert!(h.state_mut().execute("window.move_tab_new"));
+    h.state_mut().pending_window_ops_for_test();
+
+    assert_eq!(h.state().views.len(), 2, "the tab remains in the root window");
+    assert_eq!(h.state().active, Some(1));
+    assert_eq!(h.state().views[1].id, doc);
+    assert_eq!(h.state().view_count(doc), views_before);
+    assert_full_window_refusal_keeps_document_and_view(h.state_mut(), WindowId::ROOT, 1, doc, &expected);
+    assert!(h.state().toast.is_some(), "the user is told the window limit was reached");
+    let _ = std::fs::remove_dir_all(recovery_dir);
+}
+
+#[test]
+fn move_tab_new_at_window_limit_keeps_child_source_and_its_work() {
+    let mut h = two_docs_harness();
+    let root_doc = h.state().views[0].id;
+    let child_doc = h.state().views[1].id;
+    let child = h.state_mut().test_add_parked_view(root_doc).unwrap();
+    h.state_mut().with_window(child, |a| {
+        let info = a.session.get(child_doc).unwrap().info.clone();
+        a.views.push(pdfcraft_ui_egui::DocView::new(child_doc, &info, a.view_defaults));
+        a.active = Some(1);
+    });
+    rotate_in(&mut h, child);
+    configure_transfer_view(h.state_mut(), child, 1);
+    fill_window_slots(&mut h, root_doc);
+    assert_eq!(h.state().window_count(), pdfcraft_ui_egui::windows::MAX_WINDOWS);
+    let recovery_dir = enable_test_recovery(h.state_mut(), "child");
+    let views_before = h.state().view_count(child_doc);
+    let expected = transfer_snapshot(h.state_mut(), child, 1, child_doc);
+
+    assert!(h.state_mut().with_window(child, |a| a.execute("window.move_tab_new")).unwrap());
+    h.state_mut().pending_window_ops_for_test();
+
+    assert_eq!(
+        h.state_mut().with_window(child, |a| (a.views.len(), a.active, a.views.get(1).map(|view| view.id))).unwrap(),
+        (2, Some(1), Some(child_doc))
+    );
+    assert_eq!(h.state().view_count(child_doc), views_before);
+    assert_full_window_refusal_keeps_document_and_view(h.state_mut(), child, 1, child_doc, &expected);
+    // Queued window operations run in the root window, which owns the existing notice.
+    assert!(h.state().toast.is_some(), "the user is told the window limit was reached");
+    let _ = std::fs::remove_dir_all(recovery_dir);
+}
+
+#[test]
+fn move_tab_at_window_limit_keeps_child_with_its_only_view() {
+    use pdfcraft_ui_egui::WindowOp;
+
+    let mut h = two_docs_harness();
+    let root_doc = h.state().views[0].id;
+    let child = h.state_mut().test_add_parked_view(root_doc).unwrap();
+    let child_doc = h
+        .state_mut()
+        .with_window(child, |a| {
+            a.open_bytes("child-only.pdf", None, include_bytes!("data/form.pdf").to_vec()).unwrap();
+            a.close_tab(0);
+            a.views[0].id
+        })
+        .unwrap();
+    assert_eq!(h.state_mut().with_window(child, |a| a.views.len()).unwrap(), 1);
+    rotate_in(&mut h, child);
+    configure_transfer_view(h.state_mut(), child, 0);
+    fill_window_slots(&mut h, root_doc);
+    assert_eq!(h.state().window_count(), pdfcraft_ui_egui::windows::MAX_WINDOWS);
+    let recovery_dir = enable_test_recovery(h.state_mut(), "child-only");
+    let expected = transfer_snapshot(h.state_mut(), child, 0, child_doc);
+
+    h.state_mut().queue_window_op(WindowOp::MoveTab { doc: child_doc, from: child, to: None });
+    h.state_mut().pending_window_ops_for_test();
+
+    assert_eq!(h.state().window_ids(), expected.window_ids);
+    assert_eq!(h.state().session.docs().iter().map(|document| document.id).collect::<Vec<_>>(), expected.document_ids);
+    assert_eq!(h.state_mut().with_window(child, |a| (a.views.len(), a.active, a.views[0].id)).unwrap(), (1, Some(0), child_doc));
+    assert_full_window_refusal_keeps_document_and_view(h.state_mut(), child, 0, child_doc, &expected);
+    assert!(h.state().toast.is_some(), "the user is told the window limit was reached");
+    let _ = std::fs::remove_dir_all(recovery_dir);
+}
+
+/// The root counts toward MAX_WINDOWS: the last free slot is usable, then refusal is atomic.
+#[test]
+fn transfer_creates_the_final_allowed_window_then_refuses_the_next() {
+    use pdfcraft_ui_egui::{WindowOp, windows::MAX_WINDOWS};
+
+    let mut h = two_docs_harness();
+    let filler = h.state().views[0].id;
+    let doc = h.state().views[1].id;
+    rotate_in(&mut h, WindowId::ROOT);
+    configure_transfer_view(h.state_mut(), WindowId::ROOT, 1);
+    while h.state().window_count() < MAX_WINDOWS - 1 {
+        assert!(h.state_mut().test_add_parked_view(filler).is_some());
+    }
+    assert_eq!(h.state().window_count(), MAX_WINDOWS - 1);
+    let before = transfer_view_state(h.state_mut(), WindowId::ROOT, 1);
+    let windows_before = h.state().window_ids();
+    let recovery_dir = enable_test_recovery(h.state_mut(), "boundary");
+
+    h.state_mut().queue_window_op(WindowOp::MoveTab { doc, from: WindowId::ROOT, to: None });
+    h.state_mut().pending_window_ops_for_test();
+
+    assert_eq!(h.state().window_count(), MAX_WINDOWS, "the final window slot is usable");
+    let child = h.state().window_ids().into_iter().find(|id| !windows_before.contains(id)).unwrap();
+    assert_eq!(h.state().views.len(), 1);
+    assert_eq!(h.state().views[0].id, filler);
+    assert_eq!(transfer_view_state(h.state_mut(), child, 0), before, "the original view moves intact");
+    assert_eq!(h.state().view_count(doc), 1);
+    assert_eq!(h.state().session.docs().len(), 2);
+    let at_capacity = transfer_snapshot(h.state_mut(), child, 0, doc);
+
+    h.state_mut().queue_window_op(WindowOp::MoveTab { doc, from: child, to: None });
+    h.state_mut().pending_window_ops_for_test();
+
+    assert_eq!(h.state().window_count(), MAX_WINDOWS, "no window beyond the limit is created");
+    assert_full_window_refusal_keeps_document_and_view(h.state_mut(), child, 0, doc, &at_capacity);
+    let _ = std::fs::remove_dir_all(recovery_dir);
+}
+
+#[test]
+fn move_tab_to_existing_window_still_works_at_window_limit() {
+    use pdfcraft_ui_egui::WindowOp;
+
+    let mut h = two_docs_harness();
+    let doc = h.state().views[1].id;
+    fill_window_slots(&mut h, doc);
+    let target = h.state().window_ids()[1];
+    let views_before = h.state().view_count(doc);
+    h.state_mut().queue_window_op(WindowOp::MoveTab { doc, from: WindowId::ROOT, to: Some(target) });
+    h.state_mut().pending_window_ops_for_test();
+
+    assert_eq!(h.state().window_count(), pdfcraft_ui_egui::windows::MAX_WINDOWS);
+    assert_eq!(h.state().view_count(doc), views_before - 1, "the existing target view is reused");
+    assert!(!h.state().views.iter().any(|view| view.id == doc));
+    assert_eq!(h.state_mut().with_window(target, |a| a.views[a.active.unwrap()].id).unwrap(), doc);
+    assert_windows_ok(h.state());
+}
+
 #[test]
 fn merge_all_dedupes_views() {
     let mut h = two_docs_harness();
